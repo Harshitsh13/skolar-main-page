@@ -1,0 +1,22 @@
+    // ───────────── PUBLIC WEBSITE CONTENT (SKOLAR main website) ─────────────
+    // Paste inside `match /databases/{database}/documents { … }` in backend/firestore.rules.
+    // Anyone may read PUBLISHED items (the website queries with these exact filters);
+    // only team members with `site.manage` may write.
+
+    match /siteDestinations/{id} {
+      allow read: if resource.data.published == true || hasPermission('site.manage');
+      allow write: if hasPermission('site.manage');
+    }
+
+    match /siteArticles/{id} {
+      allow read: if resource.data.status == 'published' || hasPermission('site.manage');
+      allow write: if hasPermission('site.manage');
+    }
+
+    // University Finder assessments are written by the website's server (Admin SDK,
+    // which bypasses rules). Team members can read them; nobody writes from a browser.
+    match /finderAssessments/{id} {
+      allow read: if hasPermission('module.students');
+      allow update: if hasPermission('student.edit');
+      allow create, delete: if false;
+    }

@@ -1,0 +1,13 @@
+{
+  "_comment": "Add these objects to the `indexes` array in backend/firestore.indexes.json, then run: firebase deploy --only firestore:indexes",
+  "indexes": [
+    {
+      "collectionGroup": "siteArticles",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "status", "order": "ASCENDING" },
+        { "fieldPath": "publishedAt", "order": "DESCENDING" }
+      ]
+    }
+  ]
+}
