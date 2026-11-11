@@ -43,7 +43,7 @@ export async function getDestinations(): Promise<ContentResult<Destination>> {
       .sort((a, b) => a.order - b.order);
     return items.length ? { items, source: "firestore" } : defaultDestinationsResult();
   } catch (err) {
-    console.error("[content] destinations:", err);
+    console.warn("[content] destinations fallback:", err instanceof Error ? err.message : err);
     return defaultDestinationsResult();
   }
 }
@@ -83,7 +83,7 @@ export async function getArticles(limit = 6): Promise<ContentResult<Article>> {
     if (f > 0) items.unshift(...items.splice(f, 1));
     return items.length ? { items, source: "firestore" } : fallback(sampleArticles.slice(0, limit));
   } catch (err) {
-    console.error("[content] articles:", err);
+    console.warn("[content] articles fallback:", err instanceof Error ? err.message : err);
     return fallback(sampleArticles.slice(0, limit));
   }
 }

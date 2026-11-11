@@ -1,5 +1,6 @@
 import "server-only";
 import type { FinderAnswers, FinderResult } from "./finder-schema";
+import { getAdminDb, hasFirebaseAdmin } from "./firebase-admin";
 
 /**
  * Optional persistence of University Finder assessments to Firestore
@@ -10,24 +11,8 @@ import type { FinderAnswers, FinderResult } from "./finder-schema";
  * answer may still contain personal details, so describe this in the Privacy Policy.
  */
 
-let dbPromise: Promise<import("firebase-admin/firestore").Firestore> | null = null;
-
 function enabled() {
-  return process.env.FINDER_STORE_ASSESSMENTS === "true" && Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-}
-
-async function getDb() {
-  if (!dbPromise) {
-    dbPromise = (async () => {
-      const { initializeApp, getApps, cert } = await import("firebase-admin/app");
-      const { getFirestore } = await import("firebase-admin/firestore");
-      const app =
-        getApps().find((a) => a.name === "skolar-site") ??
-        initializeApp({ credential: cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON!)) }, "skolar-site");
-      return getFirestore(app);
-    })();
-  }
-  return dbPromise;
+  return process.env.FINDER_STORE_ASSESSMENTS === "true" && hasFirebaseAdmin();
 }
 
 /** Human-friendly reference, e.g. "SK-7KQ2MD". Avoids look-alike characters. */
@@ -40,7 +25,7 @@ function makeRef() {
 export async function storeAssessment(answers: FinderAnswers, result: FinderResult, model: string): Promise<string | null> {
   if (!enabled()) return null;
   try {
-    const db = await getDb();
+    const db = await getAdminDb();
     const ref = makeRef();
     await db.collection("finderAssessments").doc(ref).set({
       ref,
