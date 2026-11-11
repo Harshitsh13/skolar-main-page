@@ -1,7 +1,7 @@
 import "server-only";
 import type { Article, ContentResult, Destination } from "./types";
 import { firestoreConfigured, queryPublic } from "./firestore-rest";
-import { sampleArticles, sampleDestinations } from "@/content/samples";
+import { defaultDestinations, sampleArticles } from "@/content/samples";
 import { siteConfig } from "@/config/site";
 
 const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
@@ -12,9 +12,14 @@ function fallback<T>(samples: T[]): ContentResult<T> {
   return siteConfig.showSampleContent ? { items: samples, source: "sample" } : { items: [], source: "empty" };
 }
 
+const defaultDestinationsResult = (): ContentResult<Destination> => ({
+  items: defaultDestinations,
+  source: "default",
+});
+
 /** Published destination cards, ordered as set in the admin. */
 export async function getDestinations(): Promise<ContentResult<Destination>> {
-  if (!firestoreConfigured()) return fallback(sampleDestinations);
+  if (!firestoreConfigured()) return defaultDestinationsResult();
   try {
     const rows = await queryPublic({ collection: "siteDestinations", where: { field: "published", value: true } });
     const items = rows
@@ -36,10 +41,10 @@ export async function getDestinations(): Promise<ContentResult<Destination>> {
       }))
       .filter((d) => d.title && d.url && isHttpUrl(d.url) && d.imageUrl)
       .sort((a, b) => a.order - b.order);
-    return items.length ? { items, source: "firestore" } : fallback(sampleDestinations);
+    return items.length ? { items, source: "firestore" } : defaultDestinationsResult();
   } catch (err) {
     console.error("[content] destinations:", err);
-    return fallback(sampleDestinations);
+    return defaultDestinationsResult();
   }
 }
 

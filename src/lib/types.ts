@@ -40,7 +40,7 @@ export interface Article {
   isSample?: boolean;
 }
 
-export type ContentSource = "firestore" | "sample" | "empty";
+export type ContentSource = "firestore" | "default" | "sample" | "empty";
 
 export interface ContentResult<T> {
   items: T[];

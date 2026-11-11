@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { answersSchema, resultJsonSchema, resultSchema, type FinderResponse, type FinderResult } from "@/lib/finder-schema";
 import { SYSTEM_PROMPT, buildUserPrompt } from "@/lib/finder-prompt";
-import { grokStructured, GrokNotConfiguredError } from "@/lib/grok";
+import { grokStructured, GrokNotConfiguredError, getConfiguredAiModel } from "@/lib/grok";
 import { getDestinations } from "@/lib/content";
 import { storeAssessment } from "@/lib/assessment-store";
 import type { Destination } from "@/lib/types";
@@ -68,7 +68,7 @@ export async function POST(req: Request) {
 
   const { items, source } = await getDestinations();
   // Sample cards are illustrative only and must never ground the AI.
-  const platforms = source === "firestore" ? items : [];
+  const platforms = source === "firestore" || source === "default" ? items : [];
 
   try {
     const raw = await grokStructured({
@@ -85,7 +85,7 @@ export async function POST(req: Request) {
     }
 
     const result = enforceVerification(checked.data, platforms);
-    const ref = await storeAssessment(answers, result, process.env.XAI_MODEL || "grok-4.7");
+    const ref = await storeAssessment(answers, result, getConfiguredAiModel());
 
     const response: FinderResponse = { result, ref, generatedAt: new Date().toISOString() };
     return NextResponse.json(response, { headers: { "Cache-Control": "no-store" } });

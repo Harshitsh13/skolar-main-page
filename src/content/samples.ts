@@ -1,17 +1,13 @@
 import type { Article, Destination } from "@/lib/types";
 
 /**
- * SAMPLE CONTENT: development and preview only.
- * Rendered with a visible "Sample" label, and only when Firestore has no
- * published items AND sample content is enabled (see siteConfig).
- * Production with no published content shows an empty state instead.
- *
- * The two destination entries mirror the defaults in the SKOLAR Control Center
- * (backend/src/services/countryService.ts). Please confirm the URLs before launch.
+ * Default destination platforms (Italy & Mongolia). Shown whenever Firestore
+ * has no published `siteDestinations` yet, so the country platforms remain
+ * reachable in both development and production.
  */
-export const sampleDestinations: Destination[] = [
+export const defaultDestinations: Destination[] = [
   {
-    id: "sample-italy",
+    id: "italy",
     title: "Explore Higher Education in Italy",
     description:
       "Degree programmes taught in English at public and private Italian universities, with guidance on pre-enrolment and document preparation.",
@@ -20,12 +16,11 @@ export const sampleDestinations: Destination[] = [
     countryCode: "IT",
     imageUrl: "/images/campus-courtyard.webp",
     imageAlt: "Arcaded courtyard of a historic Italian university",
-    url: "https://skolar.it",
+    url: "https://italy.skolar.it/",
     order: 1,
-    isSample: true,
   },
   {
-    id: "sample-mongolia",
+    id: "mongolia",
     title: "Study Medicine in Mongolia",
     description:
       "A dedicated platform for students exploring English-medium medical programmes in Mongolia, from eligibility questions to arrival.",
@@ -34,11 +29,18 @@ export const sampleDestinations: Destination[] = [
     countryCode: "MN",
     imageUrl: "/images/sample-campus-mongolia.webp",
     imageAlt: "University campus building in Ulaanbaatar",
-    url: "https://skolar.it/mongolia",
+    url: "https://mangolia.skolar.it/",
     order: 2,
-    isSample: true,
   },
 ];
+
+/**
+ * SAMPLE CONTENT: development and preview only.
+ * Rendered with a visible "Sample" label, and only when Firestore has no
+ * published items AND sample content is enabled (see siteConfig).
+ * Production with no published content shows an empty state instead.
+ */
+export const sampleDestinations: Destination[] = defaultDestinations;
 
 export const sampleArticles: Article[] = [
   {

@@ -7,7 +7,7 @@ const env = (v: string | undefined) => (v && v.trim() ? v.trim() : null);
 
 export const siteConfig = {
   name: "SKOLAR",
-  url: env(process.env.NEXT_PUBLIC_SITE_URL) ?? "http://localhost:3000",
+  url: (env(process.env.NEXT_PUBLIC_SITE_URL) ?? "http://localhost:3000").replace(/\/+$/, ""),
   description:
     "Explore universities that match your academic profile with the SKOLAR AI University Finder, read practical study-abroad guidance, and talk to a SKOLAR counsellor.",
   whatsappNumber: env(process.env.NEXT_PUBLIC_WHATSAPP_NUMBER)?.replace(/\D/g, "") ?? null,

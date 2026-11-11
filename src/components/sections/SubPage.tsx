@@ -11,7 +11,9 @@ export async function SubPage({ children }: { children: React.ReactNode }) {
       <main data-header-tone="light" className="min-h-[70vh] bg-paper pb-24 pt-32 lg:pt-40">
         {children}
       </main>
-      <SiteFooter destinations={destinations.source === "firestore" ? destinations.items : []} />
+      <SiteFooter
+        destinations={destinations.source === "firestore" || destinations.source === "default" ? destinations.items : []}
+      />
     </>
   );
 }
