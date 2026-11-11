@@ -33,6 +33,34 @@ function decodeFields(fields: Record<string, FsValue>): Record<string, unknown> 
   return Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, decode(v)]));
 }
 
+function encodeValue(v: unknown): FsValue {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === "string") return { stringValue: v };
+  if (typeof v === "boolean") return { booleanValue: v };
+  if (typeof v === "number") return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(encodeValue) } };
+  if (typeof v === "object") return { mapValue: { fields: encodeFields(v as Record<string, unknown>) } };
+  return { stringValue: String(v) };
+}
+
+function encodeFields(obj: Record<string, unknown>): Record<string, FsValue> {
+  const entries = Object.entries(obj)
+    .filter(([, v]) => v !== undefined)
+    .map(([k, v]) => [k, encodeValue(v)] as const);
+  return Object.fromEntries(entries);
+}
+
+function restConfig(): { project: string; key: string; base: string } {
+  const project = process.env.FIREBASE_PROJECT_ID?.trim();
+  const key = process.env.FIREBASE_WEB_API_KEY?.trim();
+  if (!project || !key) throw new Error("FIREBASE_PROJECT_ID and FIREBASE_WEB_API_KEY are not configured");
+  return {
+    project,
+    key,
+    base: `https://firestore.googleapis.com/v1/projects/${project}/databases/(default)/documents`,
+  };
+}
+
 export function firestoreConfigured(): boolean {
   return Boolean(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_WEB_API_KEY);
 }
@@ -84,4 +112,48 @@ export async function queryPublic(q: PublicQuery): Promise<Array<Record<string, 
       id: r.document!.name.split("/").pop()!,
       ...decodeFields(r.document!.fields ?? {}),
     }));
+}
+
+export async function listDocumentsRest(
+  collection: string,
+): Promise<Array<Record<string, unknown> & { id: string }>> {
+  const { key, base } = restConfig();
+  const res = await fetch(`${base}/${encodeURIComponent(collection)}?pageSize=200&key=${key}`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Firestore list ${collection} failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as { documents?: Array<{ name: string; fields?: Record<string, FsValue> }> };
+  return (data.documents ?? []).map((doc) => ({
+    id: doc.name.split("/").pop()!,
+    ...decodeFields(doc.fields ?? {}),
+  }));
+}
+
+export async function setDocumentRest(
+  collection: string,
+  id: string,
+  doc: Record<string, unknown>,
+  merge = false,
+): Promise<void> {
+  const { key, base } = restConfig();
+  const keys = Object.keys(doc).filter((k) => doc[k] !== undefined);
+  const mask = merge
+    ? keys.map((k) => `updateMask.fieldPaths=${encodeURIComponent(k)}`).join("&") + "&"
+    : "";
+  const res = await fetch(`${base}/${encodeURIComponent(collection)}/${encodeURIComponent(id)}?${mask}key=${key}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fields: encodeFields(doc) }),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Firestore write ${collection}/${id} failed: ${res.status} ${await res.text()}`);
+}
+
+export async function deleteDocumentRest(collection: string, id: string): Promise<void> {
+  const { key, base } = restConfig();
+  const res = await fetch(`${base}/${encodeURIComponent(collection)}/${encodeURIComponent(id)}?key=${key}`, {
+    method: "DELETE",
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Firestore delete ${collection}/${id} failed: ${res.status} ${await res.text()}`);
 }

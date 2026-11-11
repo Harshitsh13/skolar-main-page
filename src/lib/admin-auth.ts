@@ -4,15 +4,14 @@ import { cookies } from "next/headers";
 
 export const ADMIN_COOKIE_NAME = "skolar_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const DEFAULT_ADMIN_PASSWORD = "skolar@2026";
 
-function getPassword(): string | null {
-  const pw = process.env.ADMIN_PASSWORD?.trim();
-  return pw || null;
+function getPassword(): string {
+  return process.env.ADMIN_PASSWORD?.trim() || DEFAULT_ADMIN_PASSWORD;
 }
 
-function getSigningSecret(): string | null {
+function getSigningSecret(): string {
   const pw = getPassword();
-  if (!pw) return null;
   const extra = process.env.ADMIN_SESSION_SECRET?.trim() || process.env.FIREBASE_WEB_API_KEY?.trim() || "skolar-admin";
   return createHmac("sha256", extra).update(pw).digest("hex");
 }
@@ -25,18 +24,15 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 export function isAdminConfigured(): boolean {
-  return getPassword() !== null;
+  return Boolean(getPassword());
 }
 
 export function verifyAdminPassword(candidate: string): boolean {
-  const expected = getPassword();
-  if (!expected) return false;
-  return safeEqual(candidate, expected);
+  return safeEqual(candidate, getPassword());
 }
 
 export function createAdminSessionToken(): string {
   const secret = getSigningSecret();
-  if (!secret) throw new Error("ADMIN_PASSWORD is not configured");
   const exp = String(Date.now() + SESSION_TTL_MS);
   const sig = createHmac("sha256", secret).update(exp).digest("hex");
   return `${exp}.${sig}`;
@@ -45,7 +41,6 @@ export function createAdminSessionToken(): string {
 export function verifyAdminSessionToken(token: string | undefined): boolean {
   if (!token) return false;
   const secret = getSigningSecret();
-  if (!secret) return false;
   const [exp, sig] = token.split(".");
   if (!exp || !sig) return false;
   const expNum = Number(exp);

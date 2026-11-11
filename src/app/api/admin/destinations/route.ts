@@ -1,6 +1,6 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { withAdminDb } from "@/lib/admin-api";
+import { withAdminStore } from "@/lib/admin-api";
 
 export const runtime = "nodejs";
 
@@ -31,11 +31,11 @@ function cleanPayload(obj: Record<string, unknown>) {
 }
 
 export async function GET() {
-  return withAdminDb(async (db) => {
-    const snap = await db.collection(COL).get();
-    const items = snap.docs
-      .map((d) => ({ id: d.id, ...d.data() }))
-      .sort((a, b) => Number((a as { order?: number }).order ?? 999) - Number((b as { order?: number }).order ?? 999));
+  return withAdminStore(async (store) => {
+    const docs = await store.list(COL);
+    const items = docs.sort(
+      (a, b) => Number((a as { order?: number }).order ?? 999) - Number((b as { order?: number }).order ?? 999),
+    );
     return { items };
   });
 }
@@ -49,15 +49,13 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  return withAdminDb(async (db) => {
+  return withAdminStore(async (store) => {
     const now = new Date().toISOString();
     const { id: requestedId, ...data } = parsed.data;
-    const snap = await db.collection(COL).get();
+    const docs = await store.list(COL);
     const nextOrder =
       data.order ??
-      (snap.docs.length
-        ? Math.max(...snap.docs.map((d) => Number((d.data() as { order?: number }).order ?? 0))) + 1
-        : 1);
+      (docs.length ? Math.max(...docs.map((d) => Number((d as { order?: number }).order ?? 0))) + 1 : 1);
 
     const slug = data.countryName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
     const id = requestedId || `${slug || "dest"}-${Date.now().toString(36)}`;
@@ -69,7 +67,7 @@ export async function POST(req: Request) {
       createdAt: now,
       updatedAt: now,
     });
-    await db.collection(COL).doc(id).set(doc);
+    await store.set(COL, id, doc);
     revalidatePath("/", "layout");
     return { item: doc };
   });
@@ -84,14 +82,14 @@ export async function PATCH(req: Request) {
       { status: 400 },
     );
   }
-  return withAdminDb(async (db) => {
+  return withAdminStore(async (store) => {
     const { id, ...updates } = parsed.data;
     const doc = cleanPayload({
       ...updates,
       countryCode: updates.countryCode ? updates.countryCode.toUpperCase() : updates.countryCode,
       updatedAt: new Date().toISOString(),
     });
-    await db.collection(COL).doc(id).set(doc, { merge: true });
+    await store.set(COL, id, doc, true);
     revalidatePath("/", "layout");
     return { ok: true, id };
   });
@@ -103,8 +101,8 @@ export async function DELETE(req: Request) {
   if (!id) {
     return Response.json({ error: "missing_id", message: "Missing destination id." }, { status: 400 });
   }
-  return withAdminDb(async (db) => {
-    await db.collection(COL).doc(id).delete();
+  return withAdminStore(async (store) => {
+    await store.remove(COL, id);
     revalidatePath("/", "layout");
     return { ok: true, id };
   });

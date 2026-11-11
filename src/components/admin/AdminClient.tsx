@@ -7,7 +7,7 @@ import type { Article, Destination } from "@/lib/types";
 interface AdminConfigStatus {
   adminPassword: boolean;
   blob: boolean;
-  firestoreAdmin: boolean;
+  firestoreReady: boolean;
   firestoreProjectId: string | null;
 }
 
@@ -410,10 +410,10 @@ export function AdminClient() {
             </span>
             <span
               className={`rounded-full px-3 py-1 ${
-                config?.firestoreAdmin ? "bg-emerald-500/20 text-emerald-200" : "bg-amber-500/20 text-amber-200"
+                config?.firestoreReady ? "bg-emerald-500/20 text-emerald-200" : "bg-red-500/20 text-red-200"
               }`}
             >
-              Firestore Admin: {config?.firestoreAdmin ? config.firestoreProjectId || "Connected" : "Needs Service Account JSON"}
+              Firestore: {config?.firestoreReady ? config.firestoreProjectId || "Connected" : "Missing Firebase env"}
             </span>
             <Link href="/" target="_blank" className="btn btn-ghost-dark !min-h-9 !px-4 text-xs">
               View site
@@ -426,17 +426,6 @@ export function AdminClient() {
       </header>
 
       <div className="container-x py-10">
-        {config && !config.firestoreAdmin && (
-          <div className="mb-6 rounded-2xl border border-amber-500/40 bg-amber-50 p-5 text-sm text-amber-950">
-            <p className="font-semibold">One-time Firebase setup needed to save to Firestore:</p>
-            <p className="mt-1">
-              In Firebase Console (<strong>{config.firestoreProjectId || "skolar-main-page"}</strong>) →{" "}
-              <strong>Project Settings → Service accounts → Generate new private key</strong>, then paste the single-line JSON into{" "}
-              <code>FIREBASE_SERVICE_ACCOUNT_JSON</code> in <code>.env.local</code> and Vercel Environment Variables. Image uploads
-              to Vercel Blob already work right now.
-            </p>
-          </div>
-        )}
 
         {notice && (
           <div
@@ -621,7 +610,7 @@ export function AdminClient() {
             <div className="space-y-4 lg:col-span-7">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <h2 className="display text-[1.45rem]">Saved Countries</h2>
-                {destinations.length === 0 && config?.firestoreAdmin && (
+                {destinations.length === 0 && config?.firestoreReady && (
                   <button type="button" onClick={seedDefaults} disabled={saving} className="btn btn-gold !min-h-9 !px-4 text-xs">
                     Import Italy &amp; Mongolia defaults
                   </button>

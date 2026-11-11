@@ -7,6 +7,7 @@ import {
   verifyAdminPassword,
 } from "@/lib/admin-auth";
 import { hasFirebaseAdmin } from "@/lib/firebase-admin";
+import { firestoreConfigured } from "@/lib/firestore-rest";
 
 export const runtime = "nodejs";
 
@@ -17,7 +18,7 @@ export async function GET() {
     configured: {
       adminPassword: isAdminConfigured(),
       blob: Boolean(process.env.BLOB_READ_WRITE_TOKEN?.trim()),
-      firestoreAdmin: hasFirebaseAdmin(),
+      firestoreReady: hasFirebaseAdmin() || firestoreConfigured(),
       firestoreProjectId: process.env.FIREBASE_PROJECT_ID?.trim() || null,
     },
   });

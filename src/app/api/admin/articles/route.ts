@@ -1,6 +1,6 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { withAdminDb } from "@/lib/admin-api";
+import { withAdminStore } from "@/lib/admin-api";
 
 export const runtime = "nodejs";
 
@@ -29,15 +29,13 @@ function cleanPayload(obj: Record<string, unknown>) {
 }
 
 export async function GET() {
-  return withAdminDb(async (db) => {
-    const snap = await db.collection(COL).get();
-    const items = snap.docs
-      .map((d) => ({ id: d.id, ...d.data() }))
-      .sort((a, b) =>
-        String((b as { publishedAt?: string }).publishedAt ?? "").localeCompare(
-          String((a as { publishedAt?: string }).publishedAt ?? ""),
-        ),
-      );
+  return withAdminStore(async (store) => {
+    const docs = await store.list(COL);
+    const items = docs.sort((a, b) =>
+      String((b as { publishedAt?: string }).publishedAt ?? "").localeCompare(
+        String((a as { publishedAt?: string }).publishedAt ?? ""),
+      ),
+    );
     return { items };
   });
 }
@@ -51,7 +49,7 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  return withAdminDb(async (db) => {
+  return withAdminStore(async (store) => {
     const now = new Date().toISOString();
     const { id: requestedId, ...data } = parsed.data;
     const id = requestedId || `art-${Date.now().toString(36)}`;
@@ -62,7 +60,7 @@ export async function POST(req: Request) {
       createdAt: now,
       updatedAt: now,
     });
-    await db.collection(COL).doc(id).set(doc);
+    await store.set(COL, id, doc);
     revalidatePath("/", "layout");
     return { item: doc };
   });
@@ -77,9 +75,9 @@ export async function PATCH(req: Request) {
       { status: 400 },
     );
   }
-  return withAdminDb(async (db) => {
+  return withAdminStore(async (store) => {
     const { id, ...updates } = parsed.data;
-    await db.collection(COL).doc(id).set(cleanPayload({ ...updates, updatedAt: new Date().toISOString() }), { merge: true });
+    await store.set(COL, id, cleanPayload({ ...updates, updatedAt: new Date().toISOString() }), true);
     revalidatePath("/", "layout");
     return { ok: true, id };
   });
@@ -91,8 +89,8 @@ export async function DELETE(req: Request) {
   if (!id) {
     return Response.json({ error: "missing_id", message: "Missing article id." }, { status: 400 });
   }
-  return withAdminDb(async (db) => {
-    await db.collection(COL).doc(id).delete();
+  return withAdminStore(async (store) => {
+    await store.remove(COL, id);
     revalidatePath("/", "layout");
     return { ok: true, id };
   });
