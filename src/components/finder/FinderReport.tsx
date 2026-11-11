@@ -3,7 +3,7 @@
 import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "motion/react";
-import type { FinderAnswers, FinderResponse } from "@/lib/finder-schema";
+import type { FinderAnswers, FinderResponse, UniversityRecommendation } from "@/lib/finder-schema";
 import { describeAnswers } from "@/lib/finder-describe";
 import { whatsappLink } from "@/config/site";
 import { ArrowUpRight, Pencil, Refresh, WhatsApp } from "@/components/ui/Icons";
@@ -30,6 +30,7 @@ export function FinderReport({
   onRestart: () => void;
 }) {
   const { result, ref, generatedAt } = response;
+  const recommendations = result.universityRecommendations ?? [];
   const recap = describeAnswers(answers);
   const related = platforms.filter((p) => result.relatedPlatformIds.includes(p.id));
   const date = new Date(generatedAt).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
@@ -43,7 +44,7 @@ export function FinderReport({
             <span className="h-px w-8 bg-gold-500" /> Your SKOLAR AI report · {date}
           </p>
           <h1 className="display mt-5 max-w-3xl text-[2.4rem] sm:text-[3.2rem] lg:text-[3.6rem]">
-            Your university exploration report
+            Your university &amp; course options
           </h1>
         </div>
         <div className="flex flex-wrap gap-2.5">
@@ -61,7 +62,12 @@ export function FinderReport({
         <aside className="order-2 space-y-5 lg:order-1 lg:col-span-4">
           <div className="space-y-5 lg:sticky lg:top-24">
             <motion.div {...fade(2)} id="counsellor-panel" className="scroll-mt-24">
-              <CounsellorPanel answers={answers} brief={result.counsellorBrief} reference={ref} />
+              <CounsellorPanel
+                answers={answers}
+                brief={result.counsellorBrief}
+                recommendations={recommendations}
+                reference={ref}
+              />
             </motion.div>
             <motion.div {...fade(3)} className="rounded-[22px] border border-white/10 bg-white/[0.03] p-6">
               <div className="flex items-center justify-between">
@@ -111,8 +117,100 @@ export function FinderReport({
             )}
           </div>
 
+          {recommendations.length > 0 && (
+            <Section
+              title="Recommended universities &amp; courses"
+              index="01"
+              note="Matched to your current qualification and grade range. Confirm exact entry requirements, fees and deadlines with a SKOLAR counsellor."
+            >
+              <div className="space-y-4">
+                {recommendations.map((u) => {
+                  const courseHref = whatsappLink(
+                    buildWhatsAppMessage({
+                      answers,
+                      includeDetails: true,
+                      brief: result.counsellorBrief,
+                      focusRecommendation: u,
+                      reference: ref,
+                    }),
+                  );
+                  return (
+                    <div
+                      key={`${u.universityName}-${u.courseTitle}`}
+                      className="rounded-2xl border border-navy-900/10 bg-white p-5 sm:p-6"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <p className="text-[0.82rem] font-medium text-ink-faint">
+                            {u.universityName} · {u.country}
+                          </p>
+                          <h4 className="mt-1 text-[1.12rem] font-semibold leading-snug text-navy-900">{u.courseTitle}</h4>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="rounded-full bg-navy-900 px-2.5 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.06em] text-paper">
+                            {u.fitTier}
+                          </span>
+                          <span className="rounded-full bg-stone px-2.5 py-1 text-[0.7rem] font-medium text-navy-800">
+                            {u.entryRoute}
+                          </span>
+                          <span
+                            className={`rounded-full px-2.5 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.06em] ${
+                              u.status === "skolar_listed"
+                                ? "bg-gold-100 text-gold-600"
+                                : "border border-navy-900/15 text-ink-soft"
+                            }`}
+                          >
+                            {u.status === "skolar_listed" ? "Listed by SKOLAR" : "To verify"}
+                          </span>
+                        </div>
+                      </div>
+
+                      <p className="mt-3 text-[0.95rem] leading-relaxed text-ink-soft">{u.whyItFits}</p>
+
+                      {u.requirementsToCheck.length > 0 && (
+                        <div className="mt-4 border-t border-dashed border-navy-900/12 pt-3.5">
+                          <p className="text-[0.72rem] font-semibold uppercase tracking-[0.12em] text-ink-faint">
+                            Requirements to confirm
+                          </p>
+                          <ul className="mt-2 space-y-1.5">
+                            {u.requirementsToCheck.map((c) => (
+                              <li key={c} className="flex gap-2.5 text-[0.88rem] text-navy-700">
+                                <span className="mt-[0.55rem] h-1 w-1 shrink-0 rounded-full bg-gold-500" />
+                                {c}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {courseHref && (
+                        <div className="mt-4 border-t border-navy-900/8 pt-3">
+                          <a
+                            href={courseHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() =>
+                              window.dispatchEvent(
+                                new CustomEvent("skolar:finder", {
+                                  detail: { event: "whatsapp", shared: true, course: u.courseTitle },
+                                }),
+                              )
+                            }
+                            className="inline-flex items-center gap-2 text-[0.85rem] font-semibold text-navy-900 underline-offset-4 hover:text-gold-600 hover:underline"
+                          >
+                            <WhatsApp size={15} /> Ask a SKOLAR counsellor about this course
+                          </a>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </Section>
+          )}
+
           {result.pathways.length > 0 && (
-            <Section title="Study pathways to explore" index="01">
+            <Section title="Study pathways to compare" index="02">
               <div className="space-y-4">
                 {result.pathways.map((p, i) => (
                   <div key={i} className="rounded-2xl border border-navy-900/10 bg-white p-5 sm:p-6">
@@ -139,36 +237,6 @@ export function FinderReport({
                   </div>
                 ))}
               </div>
-            </Section>
-          )}
-
-          {result.universityExamples.length > 0 && (
-            <Section
-              title="Universities you could look into"
-              index="02"
-              note="Suggestions to research, not confirmed matches. Entry requirements, fees and deadlines must be verified with each university."
-            >
-              <ul className="divide-y divide-navy-900/8 border-y border-navy-900/8">
-                {result.universityExamples.map((u) => (
-                  <li key={u.name} className="grid gap-1 py-4 sm:grid-cols-[1fr_auto] sm:gap-6">
-                    <div>
-                      <p className="font-semibold">
-                        {u.name} <span className="font-normal text-ink-faint">· {u.country}</span>
-                      </p>
-                      <p className="mt-1 text-[0.92rem] text-ink-soft">{u.why}</p>
-                    </div>
-                    <span
-                      className={`mt-1 h-fit w-fit rounded-full px-2.5 py-1 text-[0.7rem] font-semibold uppercase tracking-[0.08em] ${
-                        u.status === "skolar_listed"
-                          ? "bg-gold-100 text-gold-600"
-                          : "border border-navy-900/15 text-ink-soft"
-                      }`}
-                    >
-                      {u.status === "skolar_listed" ? "Listed by SKOLAR" : "To verify"}
-                    </span>
-                  </li>
-                ))}
-              </ul>
             </Section>
           )}
 
@@ -300,12 +368,22 @@ function Section({ title, index, note, children }: { title: string; index: strin
   );
 }
 
-function CounsellorPanel({ answers, brief, reference }: { answers: FinderAnswers; brief: string; reference: string | null }) {
-  const [share, setShare] = useState(false);
+function CounsellorPanel({
+  answers,
+  brief,
+  recommendations,
+  reference,
+}: {
+  answers: FinderAnswers;
+  brief: string;
+  recommendations: UniversityRecommendation[];
+  reference: string | null;
+}) {
+  const [share, setShare] = useState(true);
   const [showPreview, setShowPreview] = useState(false);
   const message = useMemo(
-    () => buildWhatsAppMessage({ answers, includeDetails: share, brief, reference }),
-    [answers, share, brief, reference],
+    () => buildWhatsAppMessage({ answers, includeDetails: share, brief, recommendations, reference }),
+    [answers, share, brief, recommendations, reference],
   );
   const href = whatsappLink(message);
 
@@ -314,8 +392,11 @@ function CounsellorPanel({ answers, brief, reference }: { answers: FinderAnswers
       <WhatsApp size={120} className="pointer-events-none absolute -right-6 -top-6 text-navy-950/[0.07]" />
       <p className="eyebrow text-navy-950/60">Next: talk it through</p>
       <h2 className="display mt-3 text-[1.65rem] leading-[1.15]">Discuss your options with a SKOLAR counsellor.</h2>
+      <p className="mt-2.5 text-[0.88rem] leading-relaxed text-navy-950/75">
+        Get your exact grade equivalency checked, narrow your final shortlist, and plan applications and scholarships.
+      </p>
 
-      <label className="mt-5 flex cursor-pointer items-start gap-3 rounded-xl bg-navy-950/[0.07] p-3.5">
+      <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl bg-navy-950/[0.07] p-3.5">
         <input
           type="checkbox"
           checked={share}
@@ -323,7 +404,7 @@ function CounsellorPanel({ answers, brief, reference }: { answers: FinderAnswers
           className="mt-0.5 h-4 w-4 shrink-0 accent-navy-900"
         />
         <span className="text-[0.86rem] leading-snug">
-          Include my answers, preferred destination and report summary in the message
+          Include my profile, recommended courses, and report summary in the WhatsApp message
         </span>
       </label>
 

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { answersSchema, resultJsonSchema, resultSchema, type FinderResponse, type FinderResult } from "@/lib/finder-schema";
 import { SYSTEM_PROMPT, buildUserPrompt } from "@/lib/finder-prompt";
-import { grokStructured, GrokNotConfiguredError, getConfiguredAiModel } from "@/lib/grok";
+import { grokStructured, GrokNotConfiguredError, AiRateLimitError, getConfiguredAiModel } from "@/lib/grok";
 import { getDestinations } from "@/lib/content";
 import { storeAssessment } from "@/lib/assessment-store";
 import type { Destination } from "@/lib/types";
@@ -32,9 +32,9 @@ function enforceVerification(result: FinderResult, platforms: Destination[]): Fi
   const listed = new Set(platforms.flatMap((p) => p.institutions ?? []).map(norm));
   return {
     ...result,
-    universityExamples: result.universityExamples.map((u) => ({
+    universityRecommendations: result.universityRecommendations.map((u) => ({
       ...u,
-      status: u.status === "skolar_listed" && listed.has(norm(u.name)) ? "skolar_listed" : "to_verify",
+      status: u.status === "skolar_listed" && listed.has(norm(u.universityName)) ? "skolar_listed" : "to_verify",
     })),
     relatedPlatformIds: [...new Set(result.relatedPlatformIds)].filter((id) => platformIds.has(id)),
     counsellorBrief: result.counsellorBrief.slice(0, 400),
@@ -45,8 +45,12 @@ export async function POST(req: Request) {
   const ip = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
   if (rateLimited(ip)) {
     return NextResponse.json(
-      { error: "rate_limited", message: "You've run several searches in a short time. Please wait a few minutes and try again." },
-      { status: 429 },
+      {
+        error: "rate_limited",
+        retryAfterSeconds: 90,
+        message: "You've run several searches in a short time. Please wait a couple of minutes and try again, or send your answers directly to a SKOLAR counsellor.",
+      },
+      { status: 429, headers: { "Retry-After": "90" } },
     );
   }
 
@@ -97,6 +101,17 @@ export async function POST(req: Request) {
           message: "The University Finder isn't connected yet. A SKOLAR counsellor can review your answers with you instead.",
         },
         { status: 503 },
+      );
+    }
+    if (err instanceof AiRateLimitError) {
+      return NextResponse.json(
+        {
+          error: "queued",
+          retryAfterSeconds: err.retryAfterSeconds,
+          message:
+            "A lot of students are using the University Finder right now. Please wait a few minutes while we free up a spot, or message a SKOLAR counsellor directly.",
+        },
+        { status: 429, headers: { "Retry-After": String(err.retryAfterSeconds) } },
       );
     }
     console.error("[finder] analysis failed:", err);

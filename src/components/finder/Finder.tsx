@@ -22,7 +22,7 @@ import type { FinderAnswers, FinderResponse } from "@/lib/finder-schema";
 import { describeAnswers } from "@/lib/finder-describe";
 import { ArrowLeft, ArrowRight, Close } from "@/components/ui/Icons";
 import { Chip, OptionTile, TextField } from "./controls";
-import { FinderLoading } from "./FinderLoading";
+import { FinderLoading, type QueueStatus } from "./FinderLoading";
 import { FinderReport } from "./FinderReport";
 import { FinderError } from "./FinderError";
 
@@ -73,7 +73,8 @@ const EMPTY: Draft = {
 };
 
 const STEPS = ["Education", "Grades", "Subject", "Destination", "About you"] as const;
-const STORAGE_KEY = "skolar-finder-v1";
+const STORAGE_KEY = "skolar-finder-v2";
+const MAX_QUEUE_RETRIES = 2;
 
 function toAnswers(d: Draft): FinderAnswers {
   return {
@@ -124,6 +125,7 @@ export function Finder({ platforms }: { platforms: PlatformLink[] }) {
   const [d, setD] = useState<Draft>(EMPTY);
   const [response, setResponse] = useState<FinderResponse | null>(null);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
+  const [queue, setQueue] = useState<QueueStatus | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -169,12 +171,12 @@ export function Finder({ platforms }: { platforms: PlatformLink[] }) {
 
   const update = useCallback((patch: Partial<Draft>) => setD((prev) => ({ ...prev, ...patch })), []);
 
-  const scrollToFinder = () => {
+  const scrollToFinder = useCallback(() => {
     const el = rootRef.current;
     if (!el) return;
     const top = el.getBoundingClientRect().top + window.scrollY - 84;
     if (Math.abs(window.scrollY - top) > 40) window.scrollTo({ top, behavior: reduce ? "auto" : "smooth" });
-  };
+  }, [reduce]);
 
   const start = () => {
     setStage("questions");
@@ -193,42 +195,73 @@ export function Finder({ platforms }: { platforms: PlatformLink[] }) {
     if (stage === "questions") headingRef.current?.focus({ preventScroll: true });
   }, [step, stage]);
 
-  const submit = async () => {
-    setStage("loading");
-    setError(null);
-    track("submit");
-    requestAnimationFrame(scrollToFinder);
-    try {
-      const res = await fetch("/api/finder", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(toAnswers(d)),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError({ code: data.error ?? "unknown", message: data.message ?? "Something went wrong. Please try again." });
-        setStage("error");
-        return;
+  const submit = useCallback(
+    async (attempt = 0) => {
+      setStage("loading");
+      setError(null);
+      setQueue(null);
+      if (attempt === 0) {
+        track("submit");
+        requestAnimationFrame(scrollToFinder);
       }
-      setResponse(data as FinderResponse);
-      setStage("result");
-      track("complete", { ref: (data as FinderResponse).ref });
-      requestAnimationFrame(scrollToFinder);
-    } catch {
-      setError({ code: "network", message: "We couldn't reach SKOLAR. Check your connection and try again." });
-      setStage("error");
+      try {
+        const res = await fetch("/api/finder", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(toAnswers(d)),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 429 && data.error === "queued" && attempt < MAX_QUEUE_RETRIES) {
+          const waitSeconds = Math.min(180, Math.max(10, Number(data.retryAfterSeconds) || 25));
+          setQueue({
+            remainingSeconds: waitSeconds,
+            attempt: attempt + 1,
+            message:
+              data.message ??
+              "A lot of students are using the University Finder right now. Please wait a moment while we keep your spot in the queue.",
+          });
+          return;
+        }
+        if (!res.ok) {
+          setError({ code: data.error ?? "unknown", message: data.message ?? "Something went wrong. Please try again." });
+          setStage("error");
+          return;
+        }
+        setResponse(data as FinderResponse);
+        setStage("result");
+        track("complete", { ref: (data as FinderResponse).ref });
+        requestAnimationFrame(scrollToFinder);
+      } catch {
+        setError({ code: "network", message: "We couldn't reach SKOLAR. Check your connection and try again." });
+        setStage("error");
+      }
+    },
+    [d, scrollToFinder],
+  );
+
+  useEffect(() => {
+    if (stage !== "loading" || !queue) return;
+    if (queue.remainingSeconds <= 0) {
+      void submit(queue.attempt);
+      return;
     }
-  };
+    const timer = window.setTimeout(() => {
+      setQueue((prev) => (prev ? { ...prev, remainingSeconds: prev.remainingSeconds - 1 } : null));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [stage, queue, submit]);
 
   const next = () => {
     if (!stepValid(step, d)) return;
     if (step < STEPS.length - 1) goTo(step + 1);
-    else void submit();
+    else void submit(0);
   };
 
   const restart = () => {
     setD(EMPTY);
     setResponse(null);
+    setQueue(null);
+    setError(null);
     setStep(0);
     setStage("intro");
     try {
@@ -239,6 +272,8 @@ export function Finder({ platforms }: { platforms: PlatformLink[] }) {
 
   const editAnswers = () => {
     setResponse(null);
+    setQueue(null);
+    setError(null);
     setStage("questions");
     setDir(-1);
     setStep(0);
@@ -422,9 +457,11 @@ export function Finder({ platforms }: { platforms: PlatformLink[] }) {
                     </div>
                   </>
                 )}
-                {stage === "loading" && <FinderLoading answers={describeAnswers(toAnswers(d))} />}
+                {stage === "loading" && (
+                  <FinderLoading answers={describeAnswers(toAnswers(d))} rawAnswers={toAnswers(d)} queue={queue} />
+                )}
                 {stage === "error" && error && (
-                  <FinderError error={error} onRetry={submit} onEdit={() => setStage("questions")} answers={toAnswers(d)} />
+                  <FinderError error={error} onRetry={() => void submit(0)} onEdit={() => setStage("questions")} answers={toAnswers(d)} />
                 )}
               </div>
             )}

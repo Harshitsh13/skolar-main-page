@@ -13,6 +13,26 @@ const DEFAULT_XAI_MODEL = "grok-4.7";
 
 export class GrokNotConfiguredError extends Error {}
 
+export class AiRateLimitError extends Error {
+  readonly retryAfterSeconds: number;
+  constructor(message: string, retryAfterSeconds = 25) {
+    super(message);
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+function parseRetryAfter(header: string | null): number {
+  if (!header) return 25;
+  const secs = Number(header);
+  if (Number.isFinite(secs) && secs > 0) return Math.min(180, Math.max(5, Math.ceil(secs)));
+  const dateMs = Date.parse(header);
+  if (Number.isFinite(dateMs)) {
+    const diff = Math.ceil((dateMs - Date.now()) / 1000);
+    if (diff > 0) return Math.min(180, Math.max(5, diff));
+  }
+  return 25;
+}
+
 interface AiProviderConfig {
   label: string;
   url: string;
@@ -80,6 +100,11 @@ export async function grokStructured<T = unknown>(opts: {
       }),
       cache: "no-store",
     });
+
+    if (res.status === 429) {
+      const retryAfter = parseRetryAfter(res.headers.get("retry-after"));
+      throw new AiRateLimitError(`${provider.label} rate limit reached: ${(await res.text()).slice(0, 300)}`, retryAfter);
+    }
 
     if (!res.ok) {
       throw new Error(`${provider.label} ${res.status}: ${(await res.text()).slice(0, 500)}`);
