@@ -13,13 +13,15 @@ const host = (url: string) => {
 };
 
 function DestinationCard({ d, large }: { d: Destination; large: boolean }) {
+  // A country with its own page on this site links there; otherwise to its external platform.
+  const internal = Boolean(d.pageUrl) || d.url.startsWith("/");
+  const href = d.pageUrl ?? d.url;
   return (
     <a
-      href={d.url}
-      target="_blank"
-      rel="noopener noreferrer"
+      href={href}
+      {...(internal ? {} : { target: "_blank", rel: "noopener noreferrer" })}
       className="group relative flex h-full flex-col overflow-hidden rounded-[24px] bg-navy-800 text-paper ring-1 ring-white/10"
-      aria-label={`${d.title}: opens the ${d.countryName ?? ""} SKOLAR platform in a new tab`}
+      aria-label={internal ? `${d.title}: about studying in ${d.countryName ?? ""} with SKOLAR` : `${d.title}: opens the ${d.countryName ?? ""} SKOLAR platform in a new tab`}
     >
       <div className={`img-zoom relative w-full overflow-hidden ${large ? "aspect-[4/3.6] sm:aspect-[16/12]" : "aspect-[4/4.2]"}`}>
         <Image
@@ -33,7 +35,7 @@ function DestinationCard({ d, large }: { d: Destination; large: boolean }) {
         {/* Consistent SKOLAR lockup across every destination */}
         <div className="absolute inset-x-0 top-0 flex items-start justify-between gap-3 p-5 sm:p-6">
           <span className="rounded-full bg-navy-950/55 px-3 py-1.5 text-[0.72rem] font-semibold uppercase tracking-[0.16em] backdrop-blur-md">
-            SKOLAR <span className="text-gold-300">{d.countryName ? `· ${d.countryName}` : ""}</span>
+            {d.flag && <span aria-hidden className="mr-1.5">{d.flag}</span>}SKOLAR <span className="text-gold-300">{d.countryName ? `· ${d.countryName}` : ""}</span>
           </span>
           {d.isSample && <SampleBadge>Sample</SampleBadge>}
         </div>
@@ -45,7 +47,7 @@ function DestinationCard({ d, large }: { d: Destination; large: boolean }) {
         <div className="mt-auto flex items-center justify-between gap-4 border-t border-white/10 pt-5">
           <span className="text-[0.95rem] font-semibold">{d.ctaLabel || "Explore Platform"}</span>
           <span className="flex items-center gap-3 text-[0.8rem] text-paper/45">
-            <span className="hidden sm:inline">{host(d.url)}</span>
+            <span className="hidden sm:inline">{internal ? "skolar" : host(d.url)}</span>
             <span className="grid h-10 w-10 place-items-center rounded-full bg-paper text-navy-900 transition-colors duration-300 group-hover:bg-gold-400">
               <ArrowUpRight size={18} className="transition-transform duration-300 group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
             </span>

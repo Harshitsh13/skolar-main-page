@@ -6,8 +6,35 @@ export const ADMIN_COOKIE_NAME = "skolar_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 const DEFAULT_ADMIN_PASSWORD = "skolar@2026";
 
+/**
+ * The built-in default password only works in local development. In
+ * production (e.g. Vercel) ADMIN_PASSWORD must be set, otherwise sign-in is
+ * disabled — a password published in the repository is not a password.
+ */
 function getPassword(): string {
-  return process.env.ADMIN_PASSWORD?.trim() || DEFAULT_ADMIN_PASSWORD;
+  const configured = process.env.ADMIN_PASSWORD?.trim();
+  if (configured) return configured;
+  return process.env.NODE_ENV === "production" ? "" : DEFAULT_ADMIN_PASSWORD;
+}
+
+/* Best-effort brute-force protection (per server instance). */
+const attempts = new Map<string, { count: number; until: number }>();
+
+export function loginThrottled(key: string): boolean {
+  const a = attempts.get(key);
+  return Boolean(a && a.count >= 8 && a.until > Date.now());
+}
+
+export function recordLoginAttempt(key: string, ok: boolean) {
+  if (ok) {
+    attempts.delete(key);
+    return;
+  }
+  const a = attempts.get(key) ?? { count: 0, until: 0 };
+  a.count += 1;
+  a.until = Date.now() + 15 * 60_000;
+  attempts.set(key, a);
+  if (attempts.size > 5000) attempts.clear();
 }
 
 function getSigningSecret(): string {

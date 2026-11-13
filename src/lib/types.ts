@@ -13,6 +13,9 @@ export interface Destination {
   imageAlt?: string;
   /** External country-specific website. */
   url: string;
+  /** Internal country page (/countries/<slug>), when the country has published intro content. */
+  pageUrl?: string;
+  flag?: string;
   ctaLabel?: string;
   order: number;
   /**

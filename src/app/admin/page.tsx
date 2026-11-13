@@ -1,12 +1,5 @@
-import type { Metadata } from "next";
-import { AdminClient } from "@/components/admin/AdminClient";
+import { Overview } from "@/studio/ui/Overview";
 
-export const metadata: Metadata = {
-  title: "SKOLAR Admin",
-  robots: { index: false, follow: false },
-};
-
-export default function AdminPage() {
-  return <AdminClient />;
+export default function OverviewPage() {
+  return <Overview />;
 }
-

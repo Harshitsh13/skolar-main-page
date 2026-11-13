@@ -42,9 +42,8 @@ export function SiteFooter({ destinations }: { destinations: Destination[] }) {
                   {destinations.map((d) => (
                     <li key={d.id}>
                       <a
-                        href={d.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
+                        href={d.pageUrl ?? d.url}
+                        {...(d.pageUrl || d.url.startsWith("/") ? {} : { target: "_blank", rel: "noopener noreferrer" })}
                         className="group inline-flex items-center gap-1.5 text-[0.95rem] text-paper/80 transition-colors hover:text-paper"
                       >
                         SKOLAR {d.countryName ?? d.title}

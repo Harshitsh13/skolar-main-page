@@ -8,3 +8,6 @@ next-env.d.ts
 .env*.local
 npm-debug.log*
 .DS_Store
+
+# SKOLAR Studio local data (jobs, drafts, logs, worker lock) — never commit
+.studio-data

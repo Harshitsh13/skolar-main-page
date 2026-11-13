@@ -10,6 +10,16 @@ The public SKOLAR website: one page, in this order:
 
 Next.js 16 (App Router) · React 19 · Tailwind CSS 4 · Motion · Zod. Deploy on Vercel.
 
+## SKOLAR Studio (admin panel at `/admin`)
+
+AI research → cited drafts → review → schedule → publish for SKOLAR Insights, plus a
+background worker for five drafts a day. Full guide: **[docs/STUDIO.md](docs/STUDIO.md)**.
+
+```bash
+npm run studio:worker   # background worker (Windows: scripts/worker/install-windows.ps1)
+npm test                # Studio test suite
+```
+
 ## Run it
 
 ```bash
