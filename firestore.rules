@@ -1,0 +1,27 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ───────────── SKOLAR WEBSITE & STUDIO COLLECTIONS ─────────────
+    // Access is secured at the Next.js server layer with password 'skolar@2026'
+    // and session cookie authentication. Firestore REST API requests arrive with
+    // request.auth == null, so read and write are allowed for these collections.
+
+    match /siteDestinations/{docId} {
+      allow read, write: if true;
+    }
+
+    match /siteArticles/{docId} {
+      allow read, write: if true;
+    }
+
+    // SKOLAR Studio collections (studioArticles, studioCountries, studioJobs, etc.)
+    match /{collection}/{docId} {
+      allow read, write: if collection.matches('studio.*');
+    }
+
+    // Finder assessment records: protected from direct public modification
+    match /finderAssessments/{docId} {
+      allow read, write: if false;
+    }
+  }
+}
