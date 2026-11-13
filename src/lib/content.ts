@@ -89,11 +89,12 @@ export async function getArticles(limit = 6): Promise<ContentResult<Article>> {
   let remote: Article[] = [];
   if (firestoreConfigured()) {
     try {
+      // Omit orderBy in Firestore query so no composite index is required;
+      // articles are sorted in-memory by publishedAt below.
       const rows = await queryPublic({
         collection: "siteArticles",
         where: { field: "status", value: "published" },
-        orderBy: { field: "publishedAt", direction: "DESCENDING" },
-        limit: limit + fileItems.length,
+        limit: Math.max(50, limit + fileItems.length),
       });
       remote = rows
         .map<Article>((r) => ({

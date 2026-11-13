@@ -114,6 +114,45 @@ export async function queryPublic(q: PublicQuery): Promise<Array<Record<string, 
     }));
 }
 
+export async function getDocumentRest(
+  collection: string,
+  id: string,
+): Promise<(Record<string, unknown> & { id: string }) | null> {
+  const { key, base } = restConfig();
+  const res = await fetch(`${base}/${encodeURIComponent(collection)}/${encodeURIComponent(id)}?key=${key}`, {
+    cache: "no-store",
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Firestore get ${collection}/${id} failed: ${res.status} ${await res.text()}`);
+  const data = (await res.json()) as { fields?: Record<string, FsValue> };
+  if (!data?.fields) return null;
+  return { id, ...decodeFields(data.fields) };
+}
+
+export async function createDocumentRest(
+  collection: string,
+  id: string,
+  doc: Record<string, unknown>,
+): Promise<boolean> {
+  const { key, base } = restConfig();
+  const res = await fetch(
+    `${base}/${encodeURIComponent(collection)}?documentId=${encodeURIComponent(id)}&key=${key}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: encodeFields(doc) }),
+      cache: "no-store",
+    },
+  );
+  if (res.status === 409) return false;
+  if (!res.ok) {
+    const text = await res.text();
+    if (text.includes("ALREADY_EXISTS") || text.includes("already exists")) return false;
+    throw new Error(`Firestore create ${collection}/${id} failed: ${res.status} ${text}`);
+  }
+  return true;
+}
+
 export async function listDocumentsRest(
   collection: string,
 ): Promise<Array<Record<string, unknown> & { id: string }>> {
