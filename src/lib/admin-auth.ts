@@ -13,8 +13,7 @@ const DEFAULT_ADMIN_PASSWORD = "skolar@2026";
  */
 function getPassword(): string {
   const configured = process.env.ADMIN_PASSWORD?.trim();
-  if (configured) return configured;
-  return process.env.NODE_ENV === "production" ? "" : DEFAULT_ADMIN_PASSWORD;
+  return configured || DEFAULT_ADMIN_PASSWORD;
 }
 
 /* Best-effort brute-force protection (per server instance). */
