@@ -201,6 +201,7 @@ export async function runWorker(opts: WorkerOptions = {}): Promise<void> {
   let stopping = false;
 
   const writeStatus = async (clean = false) => {
+    if (stopping && !clean) return;
     const doc: WorkerInstance = {
       id: owner,
       host: os.hostname().slice(0, 60),
@@ -376,6 +377,7 @@ export async function runWorker(opts: WorkerOptions = {}): Promise<void> {
     await notify({ kind: "worker_stopped", level: "error", title: "Worker stopped with an error", body: errorMessage(err), href: "/admin" });
     throw err;
   } finally {
+    stopping = true;
     clearInterval(heartbeat);
     state = "stopped";
     message = "Worker stopped";

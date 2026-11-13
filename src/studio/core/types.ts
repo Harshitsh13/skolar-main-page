@@ -45,6 +45,9 @@ export type SourceType =
   | "other";
 
 export interface ArticleSource {
+  /** Stable identity (survives renumbering and reordering). Assigned on save. */
+  id?: string;
+  /** Citation number used in the text as [[n]]. */
   n: number;
   title: string;
   url: string;
@@ -67,6 +70,9 @@ export interface ArticleFact {
   question?: string;
 }
 
+/** What kind of statement a claim is (decides whether it needs a source). */
+export type ClaimKind = "fact" | "official_requirement" | "estimate" | "personal" | "promotional";
+
 export interface ArticleClaim {
   id: string;
   text: string;
@@ -74,6 +80,13 @@ export interface ArticleClaim {
   status: VerificationStatus;
   note?: string;
   academicYear?: string;
+  kind?: ClaimKind;
+  /** Where the citation comes from: the sentence itself, its paragraph, or the paragraph introducing a table/list. */
+  basis?: "sentence" | "paragraph" | "lead_in";
+  /** True when the sentence is explicitly labelled as an estimate/illustration/personal example. */
+  labelled?: boolean;
+  /** False when the cited source has no extracted evidence to compare against (manual sources). */
+  evidence?: boolean;
 }
 
 export type WarningSeverity = "block" | "warn" | "info";
@@ -84,6 +97,50 @@ export interface EditorialWarning {
   message: string;
   excerpt?: string;
   origin: "rules" | "ai" | "pipeline";
+  /**
+   * technical: the article would be broken on the site (broken citation, malformed source,
+   * leftover research marker) — blocks publishing for every article.
+   * editorial (default): advice for the editor. Blocks approval only for AI-generated drafts.
+   */
+  category?: "technical" | "editorial";
+}
+
+/** How an article was created. Stored as `origin` ("ai" | "manual"). */
+export type CreationMethod = "AI_GENERATED" | "MANUALLY_WRITTEN";
+
+/** An AI-suggested revision. Never applied without the editor's explicit approval. */
+export interface ArticleImprovement {
+  id: string;
+  createdAt: string;
+  /** Article version the proposal was generated from (applying requires the article to be unchanged since). */
+  baseVersion: number;
+  issues: Array<{ code: string; message: string; excerpt?: string }>;
+  /** Only the sections the AI was asked to revise. `index` refers to splitSections(body). */
+  sections: Array<{
+    index: number;
+    heading: string | null;
+    original: string;
+    proposed: string;
+    changed: boolean;
+    notes: string[];
+    /** Numbers in the proposal that are not in the original section — must be checked before applying. */
+    newNumbers: string[];
+    addedCitations: number[];
+    removedCitations: number[];
+    /** Set when the proposal broke a hard rule (e.g. cited a source that does not exist); it cannot be applied. */
+    rejected?: string;
+  }>;
+  instruction?: string;
+  /** Set when not every requested section could be processed (e.g. AI rate limit). */
+  incomplete?: string;
+  providers: string[];
+}
+
+export interface ArticleRevision {
+  at: string;
+  version: number;
+  reason: string;
+  body: string;
 }
 
 /** One image in an article's gallery (generated, uploaded or chosen from the library). */
@@ -149,7 +206,7 @@ export interface ArticleSchedule {
 
 export interface PublishHistoryEntry {
   at: string;
-  action: "commit" | "no_change" | "deployment" | "verified" | "failed" | "retry" | "local_file" | "redeploy";
+  action: "commit" | "no_change" | "deployment" | "verified" | "failed" | "retry" | "local_file" | "redeploy" | "site_record";
   message: string;
   commitSha?: string;
   deploymentId?: string;
@@ -184,7 +241,9 @@ export interface PublishState {
   /** Hash of the article's content fields (no timestamps): decides whether a re-publish is a real update. */
   contentKey?: string;
   contentUpdatedAt?: string;
-  target?: "github" | "local-file" | "none";
+  target?: "github" | "firestore" | "local-file" | "none";
+  /** Editorial warnings still open when the editor published (kept for the record; never marks claims verified). */
+  openWarnings?: { count: number; codes: string[]; acknowledgedAt?: string };
   siteRecord?: "firestore" | "skipped";
   deployment?: string;
   publishedAt?: string;
@@ -229,7 +288,17 @@ export interface StudioArticle {
   schedule?: ArticleSchedule;
   publish?: PublishState;
   publishHistory?: PublishHistoryEntry[];
-  review?: { approvedAt?: string; rejectedAt?: string; rejectReason?: string };
+  review?: {
+    approvedAt?: string;
+    rejectedAt?: string;
+    rejectReason?: string;
+    /** Manual articles: the editor approved after reviewing these open editorial warnings. */
+    approvedWithWarnings?: { at: string; count: number; codes: string[] };
+  };
+  /** Pending AI suggestion (see ArticleImprovement). */
+  improvement?: ArticleImprovement;
+  /** Previous bodies kept when an AI improvement was applied (newest last, max 10). */
+  revisions?: ArticleRevision[];
   version: number;
   createdAt: string;
   updatedAt: string;

@@ -4,8 +4,7 @@ import matter from "gray-matter";
 import { COL, getStore } from "./store";
 import type { PublishHistoryEntry, PublishState, StudioArticle } from "./types";
 import { studioEnv } from "./env";
-import { publishBlockers } from "./articles";
-import { citedNumbers } from "./markdown";
+import { openEditorialWarnings, publishBlockers } from "./articles";
 import { STRATEGIES } from "./strategies";
 import { addToDay, logActivity, notify } from "./ops";
 import { deploymentFor, triggerRedeploy, verifyPublicArticle } from "./deploy";
@@ -28,7 +27,16 @@ const DEPLOY_TIMEOUT_MS = 30 * 60_000;
 export interface PublishTargets {
   github: ReturnType<typeof studioEnv.github>;
   localFiles: boolean;
+  /**
+   * Publishes the Markdown file into the website's Firestore `siteArticles`
+   * record (field `content`), which /insights/[slug] already reads. Used on
+   * Vercel when GitHub is not configured — no redeploy needed.
+   */
+  firestore: boolean;
   siteRecord: boolean;
+  primary: "github" | "firestore" | "local-file" | "none";
+  /** Human explanation when publishing is unavailable (approval still works). */
+  unavailable: string | null;
 }
 
 export function publishTargets(): PublishTargets {
@@ -39,7 +47,45 @@ export function publishTargets(): PublishTargets {
   } catch {
     /* not configured */
   }
-  return { github, localFiles: !github && !studioEnv.isVercel(), siteRecord: kind === "firestore" };
+  const override = (process.env.STUDIO_PUBLISH_TARGET?.trim() || "") as "" | "github" | "firestore" | "local";
+  const firestoreOk = kind === "firestore";
+  let primary: PublishTargets["primary"] = "none";
+  if (override === "github") primary = github ? "github" : "none";
+  else if (override === "firestore") primary = firestoreOk ? "firestore" : "none";
+  else if (override === "local") primary = studioEnv.isVercel() ? "none" : "local-file";
+  else if (github) primary = "github";
+  else if (studioEnv.isVercel()) primary = firestoreOk ? "firestore" : "none";
+  else primary = "local-file";
+  let unavailable: string | null = null;
+  if (primary === "none") {
+    unavailable =
+      override === "github"
+        ? "STUDIO_PUBLISH_TARGET=github, but GITHUB_TOKEN / GITHUB_REPO are not set."
+        : override === "firestore"
+          ? "STUDIO_PUBLISH_TARGET=firestore, but Studio is not using Firestore (set FIREBASE_PROJECT_ID and FIREBASE_WEB_API_KEY)."
+          : "No publishing destination: set GITHUB_TOKEN + GITHUB_REPO, or FIREBASE_PROJECT_ID + FIREBASE_WEB_API_KEY, in Vercel.";
+  }
+  return { github: primary === "github" ? github : null, localFiles: primary === "local-file", firestore: primary === "firestore", siteRecord: firestoreOk, primary, unavailable };
+}
+
+/** Listing record shown on the homepage / Insights page (Firestore `siteArticles`). */
+function siteRecordFor(a: StudioArticle, publishedAt: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    title: a.title,
+    excerpt: a.excerpt,
+    category: STRATEGIES[a.category]?.label ?? "Insights",
+    coverImageUrl: a.coverImage?.cardUrl ?? a.coverImage?.url ?? "",
+    coverImageAlt: a.coverImage?.alt ?? "",
+    publishedAt,
+    readingMinutes: a.readingMinutes,
+    url: `/insights/${a.slug}`,
+    slug: a.slug,
+    featured: false,
+    status: "published",
+    source: "studio",
+    updatedAt: nowIso(),
+    ...extra,
+  };
 }
 
 export function articleFilePath(slug: string, dir = "content/insights") {
@@ -81,15 +127,17 @@ export function buildMarkdownFile(a: StudioArticle, publishedAt: string, updated
 
 /* ───────────── Validation ───────────── */
 
+/**
+ * Technical checks only: editorial warnings never block publishing here (AI drafts
+ * are gated at approval; manual articles are the editor's decision).
+ */
 export async function validateForPublish(a: StudioArticle, opts: { checkImage?: boolean } = {}): Promise<string[]> {
   const problems = publishBlockers(a);
-  const cited = citedNumbers(a.body);
-  const ns = new Set(a.sources.map((s) => s.n));
-  const broken = cited.filter((n) => !ns.has(n));
-  if (broken.length) problems.push(`Citations [${broken.join(", ")}] have no matching source.`);
-  if (a.sources.some((s) => !/^https?:\/\//.test(s.url))) problems.push("Every source needs a valid http(s) URL.");
-  if (!a.seoTitle.trim() || a.seoTitle.length > 70) problems.push("SEO title must be 1–70 characters.");
-  if (!a.metaDescription.trim() || a.metaDescription.length > 170) problems.push("Meta description must be 1–170 characters.");
+  const targets = publishTargets();
+  if (targets.unavailable) problems.push(`Publishing is not configured: ${targets.unavailable}`);
+  // SEO title / meta description fall back to the title / excerpt (see buildMarkdownFile); only length is technical.
+  if (a.seoTitle.length > 70) problems.push("SEO title must be 70 characters or fewer.");
+  if (a.metaDescription.length > 170) problems.push("Meta description must be 170 characters or fewer.");
   const published = (await getStore().list<Row>(COL.articles)).filter((x) => x.id !== a.id && ["published", "publishing"].includes(x.status) && x.slug === a.slug);
   if (published.length) problems.push(`Slug "${a.slug}" is already used by a published article.`);
   if (opts.checkImage !== false && a.coverImage?.url && /^https?:\/\//.test(a.coverImage.url)) {
@@ -234,6 +282,12 @@ export async function publishArticle(id: string, opts: { actor: "admin" | "worke
       else if (!commitSha || a.publish?.contentKey !== contentKey) commitSha = (await lastCommitFor(targets.github, filePath)) ?? commitSha;
       entry = r.unchanged ? { action: "no_change", message: "Content already in the repository — no new commit.", commitSha } : { action: "commit", message: `Committed ${filePath}`, commitSha };
       state = "deploying";
+    } else if (targets.firestore) {
+      // The public article route reads this record's `content` (same Markdown file as the GitHub target).
+      await store.set(COL.siteArticles, `studio-${a.id}`, siteRecordFor(a, publishedAt, { content: file, contentKey, studioArticleId: a.id }));
+      await opts.revalidate?.(["/", "/insights", `/insights/${a.slug}`]);
+      entry = { action: "site_record", message: `Saved to the website's Firestore record siteArticles/studio-${a.id} — verifying the public page.` };
+      state = "verifying";
     } else if (targets.localFiles) {
       const abs = path.join(studioEnv.projectRoot(), ...filePath.split("/"));
       await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -242,8 +296,10 @@ export async function publishArticle(id: string, opts: { actor: "admin" | "worke
       entry = { action: "local_file", message: `Wrote ${filePath} locally (GitHub not configured). Commit and push it to deploy.` };
       state = "awaiting_push";
     } else {
-      throw new PublishError("No publishing target: configure GITHUB_TOKEN and GITHUB_REPO.");
+      throw new PublishError(targets.unavailable ?? "No publishing destination is configured.");
     }
+    const open = openEditorialWarnings(a);
+    if (open.length) entry = { ...entry, message: `${entry.message} Published with ${open.length} open editorial warning(s) reviewed by the editor (${[...new Set(open.map((w) => w.code))].join(", ")}).` };
 
     const saved = await patch(id, (cur) => ({
       status: isUpdate ? "published" : "publishing",
@@ -258,12 +314,13 @@ export async function publishArticle(id: string, opts: { actor: "admin" | "worke
         committedAt: entry.action === "commit" ? nowIso() : cur.publish?.committedAt ?? nowIso(),
         repo: targets.github?.repo,
         branch: targets.github?.branch,
-        path: filePath,
+        path: targets.firestore ? `siteArticles/studio-${a.id}` : filePath,
         url: `/insights/${a.slug}`,
         contentHash: sha256(file),
         contentKey,
         contentUpdatedAt,
-        target: targets.github ? "github" : "local-file",
+        target: targets.github ? "github" : targets.firestore ? "firestore" : "local-file",
+        openWarnings: open.length ? { count: open.length, codes: [...new Set(open.map((w) => w.code))], acknowledgedAt: cur.review?.approvedWithWarnings?.at } : undefined,
         deploymentId: entry.action === "commit" ? undefined : cur.publish?.deploymentId,
         deployment: state === "awaiting_push" ? "Waiting for git push + deployment" : "Waiting for deployment",
         publishedAt: cur.publish?.publishedAt,
@@ -293,21 +350,8 @@ async function markPublished(id: string, revalidate?: Revalidator): Promise<Stud
   const now = nowIso();
   const publishedAt = a.publish?.publishedAt ?? now;
   if (publishTargets().siteRecord) {
-    await store.set(COL.siteArticles, `studio-${a.id}`, {
-      title: a.title,
-      excerpt: a.excerpt,
-      category: STRATEGIES[a.category]?.label ?? "Insights",
-      coverImageUrl: a.coverImage?.cardUrl ?? a.coverImage?.url ?? "",
-      coverImageAlt: a.coverImage?.alt ?? "",
-      publishedAt,
-      readingMinutes: a.readingMinutes,
-      url: `/insights/${a.slug}`,
-      slug: a.slug,
-      featured: false,
-      status: "published",
-      source: "studio",
-      updatedAt: now,
-    });
+    // merge: keeps the published `content` written by the Firestore target.
+    await store.set(COL.siteArticles, `studio-${a.id}`, siteRecordFor(a, publishedAt), { merge: true });
   }
   await (revalidate ?? httpRevalidate)(["/", "/insights", `/insights/${a.slug}`]);
   const saved = await patch(id, (cur) => ({

@@ -1,6 +1,7 @@
 import { COL, getStore } from "./store";
-import type { ArticleStatus, StudioArticle, StudioSettings, StudioTopic } from "./types";
+import type { ArticleStatus, CreationMethod, EditorialWarning, StudioArticle, StudioSettings, StudioTopic } from "./types";
 import { hasBlockingWarnings, lintArticle, verifyClaims } from "./safety";
+import { malformedCitations, resolveCitations, validateSources } from "./sources";
 import { newId, nowIso, readingMinutes, similarity, slugify, wordCount } from "./util";
 import { STRATEGIES } from "./strategies";
 
@@ -110,17 +111,59 @@ export function runChecks(a: StudioArticle, settings: StudioSettings) {
   return { claims, warnings, qualityGate: { passed: reasons.length === 0, reasons, checkedAt: nowIso() } };
 }
 
-/** Problems that prevent publishing (independent of the AI quality gate). */
-export function publishBlockers(a: StudioArticle): string[] {
+export const creationMethod = (a: Pick<StudioArticle, "origin">): CreationMethod => (a.origin === "ai" ? "AI_GENERATED" : "MANUALLY_WRITTEN");
+
+/**
+ * Technical problems: the article would be invalid or broken on the site.
+ * These block approval and publishing for EVERY article (manual or AI).
+ * `forPublish` adds what only the public pages need (the cover image).
+ */
+export function technicalProblems(a: StudioArticle, opts: { forPublish?: boolean } = {}): string[] {
   const out: string[] = [];
   if (!a.title.trim()) out.push("Title is missing.");
   if (!a.slug || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(a.slug)) out.push("Slug must use lowercase letters, numbers and hyphens.");
-  if (!a.excerpt.trim()) out.push("Excerpt is missing.");
-  if (wordCount(a.body) < 150) out.push("Article body is too short.");
-  if (!a.coverImage?.url) out.push("Featured image is missing.");
-  else if (!a.coverImage.alt.trim()) out.push("Featured image needs alt text.");
-  if (hasBlockingWarnings(a.warnings)) out.push("Resolve the blocking editorial warnings first.");
+  if (!a.excerpt.trim()) out.push("Excerpt is missing (it is shown on article cards and used as the search description).");
+  if (wordCount(a.body) < 50) out.push("Article body is empty or too short to publish.");
+  for (const p of validateSources(a.sources)) out.push(p.message);
+  const cites = resolveCitations(a.body, a.sources);
+  if (cites.missing.length) out.push(`Citations ${cites.missing.map((n) => `[[${n}]]`).join(", ")} have no matching source in the saved source list.`);
+  const bad = malformedCitations(a.body);
+  if (bad.length) out.push(`Malformed citation marker(s): ${bad.slice(0, 5).join(" ")} — write [[n]].`);
+  const marker = /\[F\d+[^\]]*\]/.exec(a.body);
+  if (marker) out.push(`Internal research marker left in the text: ${marker[0]}.`);
+  if (opts.forPublish) {
+    if (!a.coverImage?.url) out.push("Featured image is missing (article cards and the article page need one).");
+    else if (!a.coverImage.alt.trim()) out.push("Featured image needs alt text.");
+  }
   return out;
+}
+
+/** Editorial warnings still open (everything that is not a technical error). */
+export function openEditorialWarnings(a: Pick<StudioArticle, "warnings">): EditorialWarning[] {
+  return a.warnings.filter((w) => w.category !== "technical" && w.severity !== "info");
+}
+
+/**
+ * What prevents approval.
+ * - Every article: technical problems.
+ * - AI-generated drafts: also blocking editorial warnings and the research quality gate
+ *   (the existing verification workflow is unchanged).
+ * - Manually written articles: editorial warnings never block — the editor decides,
+ *   after acknowledging them (see the approve action).
+ */
+export function approvalBlockers(a: StudioArticle): string[] {
+  const out = technicalProblems(a);
+  if (a.origin === "ai") {
+    const blocks = a.warnings.filter((w) => w.severity === "block" && w.category !== "technical");
+    for (const w of blocks) out.push(w.message);
+    for (const r of a.qualityGate?.reasons ?? []) if (!/blocking editorial warnings/i.test(r)) out.push(r);
+  }
+  return [...new Set(out)];
+}
+
+/** Content problems that prevent publishing (publishing configuration is checked separately). */
+export function publishBlockers(a: StudioArticle): string[] {
+  return technicalProblems(a, { forPublish: true });
 }
 
 /* ───────────── Duplicate detection ───────────── */

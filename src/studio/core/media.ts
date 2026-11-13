@@ -15,9 +15,37 @@ import { errorMessage, nowIso, sha256, sleep } from "./util";
  */
 
 export const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/avif"]);
-export const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+/**
+ * Vercel Functions reject request bodies over 4.5 MB before our code runs, so the
+ * editor shrinks larger images in the browser first; the server limit matches.
+ */
+export const MAX_UPLOAD_BYTES = 4.4 * 1024 * 1024;
+
+/** Detects the real image format from its first bytes (browsers sometimes send an empty or wrong MIME type). */
+export function sniffImageType(b: Buffer): string | null {
+  if (b.length < 12) return null;
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b[0] === 0x89 && b.toString("ascii", 1, 4) === "PNG") return "image/png";
+  if (b.toString("ascii", 0, 4) === "RIFF" && b.toString("ascii", 8, 12) === "WEBP") return "image/webp";
+  if (b.toString("ascii", 4, 8) === "ftyp" && /^avi[fs]/.test(b.toString("ascii", 8, 12))) return "image/avif";
+  return null;
+}
+
+/** Turns Vercel Blob SDK errors into messages an editor can act on. */
+export function explainBlobError(msg: string): string {
+  if (/private store|access must be "private"|private access/i.test(msg)) return "The Vercel Blob store is private, but article images must be public. Create a public Blob store (or change the store's access) and update BLOB_READ_WRITE_TOKEN.";
+  if (/access denied|valid token|unauthori[sz]ed|forbidden|401|403/i.test(msg)) return "Vercel Blob rejected the token: BLOB_READ_WRITE_TOKEN is invalid, revoked or belongs to another store. Copy a fresh read-write token from the Blob store in Vercel.";
+  if (/suspended/i.test(msg)) return "The Vercel Blob store is suspended (check the Vercel account / billing).";
+  if (/store.*(not found|does not exist)/i.test(msg)) return "The Vercel Blob store for BLOB_READ_WRITE_TOKEN no longer exists.";
+  if (/too.?large|size/i.test(msg)) return "Vercel Blob refused the file because it is too large.";
+  if (/fetch failed|network|ECONN|ETIMEDOUT|ENOTFOUND|timeout/i.test(msg)) return "Could not reach Vercel Blob (network problem). Try again.";
+  return msg;
+}
+
+const BLOB_URL = /^https:\/\/[a-z0-9-]+\.public\.blob\.vercel-storage\.com\//i;
 
 export class MediaNotConfiguredError extends Error {}
+export class MediaUploadError extends Error {}
 
 export function blobConfigured(): boolean {
   return Boolean(studioEnv.blobToken());
@@ -56,6 +84,7 @@ export async function putBlob(pathname: string, data: Buffer, contentType: strin
         allowOverwrite: false,
         cacheControlMaxAge: 60 * 60 * 24 * 365,
       });
+      if (!BLOB_URL.test(out.url)) throw new MediaNotConfiguredError(`Vercel Blob returned an unexpected URL (${out.url.slice(0, 80)}); the store must be public.`);
       return { url: out.url, pathname: out.pathname };
     } catch (err) {
       lastErr = err;
@@ -68,7 +97,16 @@ export async function putBlob(pathname: string, data: Buffer, contentType: strin
       await sleep(600 * 2 ** attempt);
     }
   }
-  throw new Error(`Vercel Blob upload failed for ${pathname}: ${errorMessage(lastErr)}`);
+  throw new MediaUploadError(`Vercel Blob upload failed: ${explainBlobError(errorMessage(lastErr))}`);
+}
+
+async function blobStillExists(url: string): Promise<boolean> {
+  try {
+    await (await blob()).head(url, { token: token() });
+    return true;
+  } catch (err) {
+    return !/not.?found|does not exist/i.test(errorMessage(err));
+  }
 }
 
 export async function deleteBlob(urls: string[]): Promise<void> {
@@ -109,11 +147,18 @@ export async function storeUpload(
   file: { bytes: Buffer; name: string },
   meta: { alt: string; credit?: string; license?: string; sourceUrl?: string; articleId?: string },
 ): Promise<MediaRecord> {
-  const { data, width, height } = await optimiseImage(file.bytes);
+  let optimised: Awaited<ReturnType<typeof optimiseImage>>;
+  try {
+    optimised = await optimiseImage(file.bytes);
+  } catch (err) {
+    throw new MediaUploadError(`The image could not be read (corrupt or unsupported file): ${errorMessage(err)}`);
+  }
+  const { data, width, height } = optimised;
   const hash = sha256(data);
   const store = getStore();
   const existing = await store.get<MediaRecord & Record<string, unknown>>(COL.media, hash);
-  if (existing) return existing;
+  // The same bytes were uploaded before — reuse that file unless it has since been deleted from Blob.
+  if (existing && (await blobStillExists(existing.url))) return existing;
   const folder = meta.articleId ? `skolar/articles/${meta.articleId.replace(/[^A-Za-z0-9_-]/g, "-")}` : "skolar/media";
   const path = `${folder}/upload-${hash.slice(0, 16)}.webp`;
   const { url } = await putBlob(path, data, "image/webp");

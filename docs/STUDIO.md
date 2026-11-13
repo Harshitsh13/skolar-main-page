@@ -164,29 +164,50 @@ under *Integrations* for fallback, using only accounts you are entitled to use.
 
 ## 6. Approving and publishing safely
 
-1. **Review Queue** → open a draft.
-2. Read it in **Preview**. Check **Sources & checks**: every *Must fix* warning has to
-   be resolved before approval. Look at claims marked *Needs review*, *Unverified* or
-   *Conflicting*. *Research evidence* shows the exact quote behind each fact.
-3. Edit the text, headings, CTA, SEO and image. Use **Regenerate** on a section to
-   rewrite it from the verified facts only, or regenerate the whole article.
-4. Add a **featured image** with alt text. Upload only images SKOLAR owns or is licensed
-   to use, or pick one of the credited website photos.
-5. **Approve.** Then either:
-   * **Schedule…**: shows the next free slot (default 18:00 IST, Mon–Fri, one per day).
-     Confirm it, or pick a time yourself (a manual time is pinned).
-   * **Publish now.**
-6. Publishing:
-   * commits `content/insights/<slug>.md` to GitHub (`GITHUB_TOKEN` + `GITHUB_REPO`), and
-     the existing Vercel deployment ships it;
-   * writes the `siteArticles` record (Firestore) so it appears in the homepage Insights
-     section straight away;
-   * records the commit, file path, URL and deployment status on the article.
-   * Re-publishing unchanged content creates no new commit. A failed publish keeps the
-     article approved, records the error and retries up to 6 times for scheduled items.
+The workflow is: **Write → Save draft → (optional) checks → (optional) AI improvements →
+Preview → Approve → Publish now or Schedule.** Approval and publishing are separate steps.
+
+1. **Review Queue** → open a draft. Read it in **Preview**.
+2. **Sources & checks.** Add sources one by one or with **Paste source list** (one per
+   line, e.g. `[1] Page title — https://…`). Every source needs a title and a full
+   http(s) URL; the text cites them as `[[1]]`, `[[2]]`… (one number per marker). A
+   citation also covers the uncited sentences directly before it in the same paragraph,
+   and table rows / list items inherit the citation of the paragraph that introduces
+   them. Nothing is saved while a source is invalid — the error names the source.
+3. Warnings come in two kinds:
+   * **Technical — must fix** (blocks approval and publishing for every article): missing
+     title/slug/excerpt, empty body, a malformed source, a `[[n]]` with no matching
+     source, malformed citation markers, leftover research markers; for publishing also
+     the featured image and its alt text, and a configured publishing destination.
+   * **Editorial** (advice): uncited statements, unlabelled money amounts, promises,
+     rankings, SEO/readability, etc. For **AI-generated** drafts the existing research
+     gate is unchanged — blocking editorial warnings and the quality gate must be resolved
+     before approval. For **manually written** articles the editor decides: *Approve with
+     warnings…* lists them and requires a confirmation. The warnings stay on the
+     article's record (and on its publish record); nothing is ever marked verified.
+4. **Improve with AI** (or tick issues and **Fix selected issues**) creates a suggestion
+   beside the article. **Compare versions** shows original vs suggested per section with
+   flags for new numbers and added/removed citations. **Apply** the sections you choose
+   (the previous text is kept under *Earlier versions*) or **Keep original**. A suggestion
+   that cites a source number that does not exist cannot be applied.
+5. **Featured image** (Image tab): upload your own (drag & drop; large images are resized
+   in the browser to fit Vercel's 4.5 MB request limit), generate one, or pick a credited
+   website photo. Every option stores the file in **Vercel Blob** and saves the URL on the
+   article before it is shown; uploading does not require saving other edits first.
+6. **Approve**, then **Schedule…** (next free slot or a pinned time) or **Publish now**
+   (*Publish anyway* for a manual article with open warnings).
+7. Publishing destination (shown in the Publishing panel; approval works without one):
+   * **GitHub** (`GITHUB_TOKEN` + `GITHUB_REPO`): commits `content/insights/<slug>.md`;
+     the Vercel deployment ships it.
+   * **Firestore** (default on Vercel when GitHub is not set, needs `FIREBASE_PROJECT_ID`
+     + `FIREBASE_WEB_API_KEY`): writes the same Markdown into `siteArticles/studio-<id>`
+     (`content` field), which `/insights/[slug]` already reads — live without a redeploy.
+   * **Local files** (development): writes `content/insights/<slug>.md`; commit and push.
+   * Force one with `STUDIO_PUBLISH_TARGET=github|firestore|local`.
+   * An article is marked **published only after the live page shows the exact version**
+     (content key). Re-publishing unchanged content creates no new commit. A failed publish
+     keeps the article approved and records the error.
    * Editing an approved or scheduled article sends it back for approval.
-   * Without GitHub (local mode), the file is written into `content/insights/`.
-     Commit and push it yourself.
 
 The **Publishing Calendar** shows the queue. Use ↑/↓ to swap slots. *Recalculate queue*
 proposes moving articles into earlier free slots and shows the changes before applying
@@ -208,8 +229,11 @@ See `.env.example`. Key items:
 | `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET` | Studio sign-in (required in production) |
 | `GROQ_API_KEY`, `GROQ_MODEL` | Default AI provider (created automatically) |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Firestore storage. Required on Vercel and for multi-machine use |
-| `FIREBASE_STORAGE_BUCKET` | Images in Firebase Storage (otherwise Vercel Blob) |
-| `GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH` | Publishing commits |
+| `BLOB_READ_WRITE_TOKEN` | Vercel Blob (public store) — all Studio images. Firebase Storage is not used |
+| `GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH` | Publishing by Git commit (optional) |
+| `FIREBASE_PROJECT_ID`, `FIREBASE_WEB_API_KEY` | Studio store via Firestore REST, and the Firestore publishing target |
+| `STUDIO_PUBLISH_TARGET` | Optional: `github`, `firestore` or `local` |
+| `OPENAI_API_KEY` / `GEMINI_API_KEY` | Optional AI image provider; without one, *Generate image* uses the SKOLAR renderer |
 | `SERPER_API_KEY` / `BRAVE_SEARCH_API_KEY` / `GOOGLE_CSE_*` | Optional search discovery |
 | `STUDIO_ENCRYPTION_KEY` | Encrypts provider keys pasted into Studio |
 | `REVALIDATE_SECRET` | Worker refreshes the site right after scheduled publishing |
@@ -233,6 +257,6 @@ the build log prints a link to create it. This was already the case before Studi
   (Serper or Brave).
 * **PDF notices** (many *bandi* are PDFs) are detected and listed but not parsed. Open
   them and verify by hand.
-* **Image generation** is not available. Use owned or licensed images.
+* **Image generation** without `OPENAI_API_KEY`/`GEMINI_API_KEY` produces designed SKOLAR brand graphics (code-rendered), not AI pictures.
 * **Local mode** (no service account) is a single-computer setup. Use Firestore for
   production and for the MacBook move.

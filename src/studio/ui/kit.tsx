@@ -15,18 +15,31 @@ export class ApiError extends Error {
 }
 
 export async function api<T = unknown>(path: string, init?: { method?: string; body?: unknown; form?: FormData }): Promise<T> {
-  const res = await fetch(`/api/studio/${path}`, {
-    method: init?.method ?? (init?.body || init?.form ? "POST" : "GET"),
-    headers: init?.body !== undefined ? { "Content-Type": "application/json" } : undefined,
-    body: init?.form ?? (init?.body !== undefined ? JSON.stringify(init.body) : undefined),
-    cache: "no-store",
-  });
+  let res: Response;
+  try {
+    res = await fetch(`/api/studio/${path}`, {
+      method: init?.method ?? (init?.body || init?.form ? "POST" : "GET"),
+      headers: init?.body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      body: init?.form ?? (init?.body !== undefined ? JSON.stringify(init.body) : undefined),
+      cache: "no-store",
+    });
+  } catch {
+    throw new ApiError("Network error — the request did not reach the server. Check your connection and try again.", 0);
+  }
   const data = (await res.json().catch(() => ({}))) as T & { message?: string };
   if (res.status === 401) {
     window.location.reload();
     throw new ApiError("Session expired", 401);
   }
-  if (!res.ok) throw new ApiError(data?.message || `Request failed (${res.status})`, res.status, data);
+  if (!res.ok) {
+    const fallback =
+      res.status === 413
+        ? "The upload is larger than the server accepts (Vercel limit: 4.5 MB per request)."
+        : res.status === 504 || res.status === 502
+          ? `The server timed out or failed (HTTP ${res.status}). Nothing was saved — try again.`
+          : `Request failed (HTTP ${res.status}).`;
+    throw new ApiError(data?.message || fallback, res.status, data);
+  }
   return data;
 }
 

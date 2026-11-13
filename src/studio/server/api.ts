@@ -1,6 +1,6 @@
 import "server-only";
 import { NextResponse } from "next/server";
-import { revalidatePath } from "next/cache";
+import { revalidatePath, revalidateTag } from "next/cache";
 import { z } from "zod";
 import { isAdminAuthenticated } from "@/lib/admin-auth";
 import { imageCredits } from "@/content/credits";
@@ -23,8 +23,10 @@ import type {
 import { CATEGORY_KEYS, STRATEGIES } from "../core/strategies";
 import { getSettings, saveSettings, ValidationError } from "../core/settings";
 import {
+  approvalBlockers,
   blankArticle,
   ConflictError,
+  creationMethod,
   findDuplicates,
   getArticle,
   listArticles,
@@ -38,6 +40,9 @@ import { addToDay, getDay, logActivity, recentActivity, todayKey } from "../core
 import { listJobs, getJob, createJob, controlJob, ACTIVE } from "../core/jobs";
 import { STAGE_LABELS, writeSection, relatedFor } from "../core/pipeline";
 import { addCitationsFromEvidence } from "../core/citations";
+import { prepareSourcesForSave } from "../core/sources";
+import { ImproveError } from "../core/improve";
+import { ApprovalBlockedError, applyStoredImprovement, approveArticle, discardImprovement, requestImprovement, restoreRevision, WarningsNeedAcknowledgementError } from "../core/review";
 import { addTopic, discoverTopics, listTopics, updateTopic } from "../core/topics";
 import { checkSource, listChanges } from "../core/monitor";
 import {
@@ -52,9 +57,10 @@ import { listProviders, PROVIDER_PRESETS, testProvider, NoProviderAvailableError
 import { canEncrypt, encryptSecret, keyHint } from "../core/secrets";
 import { publishArticle, publishTargets, githubCheck, PublishError } from "../core/publish";
 import { applyCompaction, cancelSchedule, previewSlot, proposeCompaction, publishDue, scheduleArticle, ScheduleError, swapSlots } from "../core/schedule";
-import { ALLOWED_IMAGE_TYPES, blobConfigured, listMedia, MAX_UPLOAD_BYTES, storeUpload } from "../core/media";
+import { ALLOWED_IMAGE_TYPES, blobConfigured, listMedia, MAX_UPLOAD_BYTES, MediaNotConfiguredError, MediaUploadError, sniffImageType, storeUpload } from "../core/media";
 import { deleteImage, regenerateImage, selectImage, uploadArticleImage, useLibraryImage } from "../core/images/articleImages";
 import { FORMAT_LABELS } from "../core/images/service";
+import { aiProvider } from "../core/images/providers";
 import { emitJobEvent, jobEvents } from "../core/events";
 import { listIntegrations, testIntegration } from "../core/integrations";
 import { discoverOfficialPages, listDiscovered, PAGE_CATEGORY_LABEL, rejectDiscovered, verifyDiscovered } from "../core/discovery";
@@ -142,7 +148,7 @@ export async function handleStudio(req: Request, path: string[]): Promise<Respon
       const status =
         err instanceof HttpError
           ? err.status
-          : err instanceof ValidationError || err instanceof ScheduleError || err instanceof PublishError
+          : err instanceof ValidationError || err instanceof ScheduleError || err instanceof PublishError || err instanceof ImproveError || err instanceof ApprovalBlockedError
             ? 400
             : err instanceof ConflictError
               ? 409
@@ -150,9 +156,11 @@ export async function handleStudio(req: Request, path: string[]): Promise<Respon
                 ? 404
                 : err instanceof StoreNotConfiguredError
                   ? 503
-                  : err instanceof NoProviderAvailableError
+                  : err instanceof NoProviderAvailableError || err instanceof MediaNotConfiguredError
                     ? 503
-                    : 500;
+                    : err instanceof MediaUploadError
+                      ? 502
+                      : 500;
       if (status === 500) console.error("[studio]", errorMessage(err));
       return NextResponse.json({ error: "studio_error", message: errorMessage(err) }, { status });
     }
@@ -161,6 +169,8 @@ export async function handleStudio(req: Request, path: string[]): Promise<Respon
 }
 
 const revalidateSite = async (paths: string[]) => {
+  // Published article bodies/listings are fetched from Firestore with the "siteArticles" tag.
+  revalidateTag("siteArticles", { expire: 0 });
   for (const p of paths) revalidatePath(p);
   revalidatePath("/", "layout");
 };
@@ -320,25 +330,27 @@ route("GET", "articles/:id", async ({ params }) => {
   const a = await getArticle(params.id);
   if (!a) throw new HttpError(404, "Article not found.");
   const job = a.jobId ? await getJob(a.jobId) : null;
+  const t = publishTargets();
   return {
-    item: a,
-    blockers: publishBlockers(a),
+    ...articleState(a),
+    creationMethod: creationMethod(a),
+    publishing: { available: !t.unavailable, primary: t.primary, reason: t.unavailable },
     duplicates: (await findDuplicates(a.title, { excludeArticleId: a.id, excludeTopicId: a.topicId, threshold: 0.55 })).slice(0, 3),
     nextSlot: ["approved", "scheduled"].includes(a.status) ? await previewSlot(a.id) : null,
-    targets: (() => {
-      const t = publishTargets();
-      return { github: t.github ? `${t.github.repo}@${t.github.branch}` : null, localFiles: t.localFiles, siteRecord: t.siteRecord };
-    })(),
+    targets: { github: t.github ? `${t.github.repo}@${t.github.branch}` : null, localFiles: t.localFiles, firestore: t.firestore, siteRecord: t.siteRecord },
     job: job ? { id: job.id, status: job.status, gaps: (job.checkpoints.organise as { gaps?: string[] } | undefined)?.gaps ?? [] } : null,
     timezone: (await getSettings()).publishing.timezone,
   };
 });
 
+// Shape only; content rules (non-empty title, valid URL, unique numbers) are checked by
+// validateSources() so the editor gets one clear message per broken source.
 const sourceSchema = z.object({
-  n: z.number().int().min(1).max(99),
-  title: z.string().trim().min(1).max(200),
-  url: z.string().trim().url().max(600),
-  type: z.enum(["official_university", "government", "scholarship_authority", "application_portal", "publication", "other"]),
+  id: z.string().max(40).optional(),
+  n: z.number(),
+  title: z.string().max(200),
+  url: z.string().max(600),
+  type: z.enum(["official_university", "government", "scholarship_authority", "application_portal", "publication", "other"]).catch("other"),
   publisher: z.string().max(120).optional(),
   accessedAt: z.string().max(30).optional(),
   pageDate: z.string().max(30).optional(),
@@ -388,6 +400,11 @@ route("PATCH", "articles/:id", async ({ req, params }) => {
     throw new HttpError(400, "Another article already uses this slug.");
   }
   const patch: Partial<StudioArticle> = { ...rest } as Partial<StudioArticle>;
+  if (rest.sources) {
+    const { sources, problems } = prepareSourcesForSave(rest.sources as ArticleSource[], current.sources);
+    if (problems.length) throw new HttpError(400, `Not saved — fix the source list first: ${problems.map((p) => p.message).join(" ")}`);
+    patch.sources = sources;
+  }
   if (cta !== undefined) patch.cta = cta ?? undefined;
   if (coverImage !== undefined) patch.coverImage = coverImage ?? undefined;
   if (academicYear !== undefined) patch.academicYear = academicYear || undefined;
@@ -406,8 +423,13 @@ route("PATCH", "articles/:id", async ({ req, params }) => {
   patch.qualityGate = checks.qualityGate;
   if (merged.status === "needs_review" && checks.qualityGate.passed) patch.status = "draft";
   const saved = await updateArticle(params.id, patch, { expectedVersion });
-  return { item: saved, blockers: publishBlockers(saved) };
+  return articleState(saved);
 });
+
+/** Everything the editor needs after a change, so the UI never shows stale gating. */
+function articleState(a: StudioArticle) {
+  return { item: a, blockers: publishBlockers(a), approvalBlockers: approvalBlockers(a) };
+}
 
 const actionSchema = z.object({
   action: z.enum(["approve", "reject", "reopen", "publish", "schedule", "unschedule", "check", "retry_publish", "check_publish", "validate_publish", "autocite"]),
@@ -415,6 +437,8 @@ const actionSchema = z.object({
   at: z.string().max(40).optional(),
   expectedSlot: z.string().max(40).optional(),
   expectedVersion: z.number().int().optional(),
+  /** Manual articles: the editor has reviewed the open editorial warnings and approves anyway. */
+  acknowledgeWarnings: z.boolean().optional(),
 });
 
 route("POST", "articles/:id/action", async ({ req, params }) => {
@@ -430,22 +454,24 @@ route("POST", "articles/:id/action", async ({ req, params }) => {
       const checks = runChecks(merged, await getSettings());
       const saved = await updateArticle(a.id, { body: r.body, claims: checks.claims, warnings: checks.warnings, qualityGate: checks.qualityGate, status: a.status === "needs_review" && checks.qualityGate.passed ? "draft" : a.status }, { expectedVersion: input.expectedVersion });
       await logActivity("admin", "article.autocite", `Added ${r.added.length} citation(s) from research evidence${r.repairedMarkers ? `, repaired ${r.repairedMarkers} marker(s)` : ""}: ${a.title}`, a.id);
-      return { item: saved, blockers: publishBlockers(saved), autocite: { added: r.added, repairedMarkers: r.repairedMarkers, unresolved: r.unresolved } };
+      return { ...articleState(saved), autocite: { added: r.added, repairedMarkers: r.repairedMarkers, unresolved: r.unresolved } };
     }
     case "check": {
       const checks = runChecks(a, await getSettings());
       const saved = await updateArticle(a.id, { claims: checks.claims, warnings: checks.warnings, qualityGate: checks.qualityGate });
-      return { item: saved, blockers: publishBlockers(saved) };
+      return articleState(saved);
     }
     case "approve": {
-      if (!["draft", "needs_review", "rejected"].includes(a.status)) throw new HttpError(400, `Cannot approve an article that is ${a.status}.`);
-      const checks = runChecks(a, await getSettings());
-      if (checks.warnings.some((w) => w.severity === "block")) throw new HttpError(400, "Resolve the blocking editorial warnings before approving.");
-      const saved = await updateArticle(a.id, { status: "approved", claims: checks.claims, warnings: checks.warnings, review: { ...a.review, approvedAt: now } }, { expectedVersion: input.expectedVersion });
-      await addToDay("approvedIds", a.id);
-      await logActivity("admin", "article.approved", `Approved: ${a.title}`, a.id);
-      const settings = await getSettings();
-      return { item: saved, blockers: publishBlockers(saved), autoQueue: settings.publishing.autoQueue, nextSlot: await previewSlot(a.id) };
+      try {
+        const saved = await approveArticle(a.id, { acknowledgeWarnings: input.acknowledgeWarnings, expectedVersion: input.expectedVersion });
+        const settings = await getSettings();
+        return { ...articleState(saved), autoQueue: settings.publishing.autoQueue, nextSlot: await previewSlot(a.id) };
+      } catch (err) {
+        if (err instanceof WarningsNeedAcknowledgementError) {
+          return NextResponse.json({ error: "warnings_need_acknowledgement", message: err.message, warnings: err.warnings }, { status: 409 });
+        }
+        throw err;
+      }
     }
     case "reject": {
       if (a.status === "published") throw new HttpError(400, "Published articles cannot be rejected.");
@@ -460,8 +486,10 @@ route("POST", "articles/:id/action", async ({ req, params }) => {
     }
     case "publish": {
       if (a.status === "draft" || a.status === "needs_review") throw new HttpError(400, "Approve the article before publishing.");
+      const t = publishTargets();
+      if (t.unavailable) throw new HttpError(400, `Publishing is unavailable: ${t.unavailable} The article stays approved.`);
       const saved = await publishArticle(a.id, { actor: "admin", revalidate: revalidateSite });
-      return { item: saved };
+      return articleState(saved);
     }
     case "schedule": {
       const saved = await scheduleArticle(a.id, { at: input.at, expectedSlot: input.expectedSlot });
@@ -505,7 +533,33 @@ route("POST", "articles/:id/regenerate-section", async ({ req, params }) => {
   const checks = runChecks(merged, await getSettings());
   const saved = await updateArticle(a.id, { body: merged.body, claims: checks.claims, warnings: checks.warnings, qualityGate: checks.qualityGate, status: a.status === "approved" ? "draft" : a.status }, { expectedVersion: input.expectedVersion });
   await logActivity("admin", "article.section_regenerated", `Regenerated "${input.heading}" in ${a.title}`, a.id);
-  return { item: saved, blockers: publishBlockers(saved) };
+  return articleState(saved);
+});
+
+/* ── AI improvements: proposals only; the editor compares and applies explicitly ── */
+
+route("POST", "articles/:id/improve", async ({ req, params }) => {
+  const input = await body(
+    req,
+    z.object({
+      issues: z.array(z.object({ code: z.string().max(60), message: z.string().max(400), excerpt: z.string().max(400).optional() })).max(40).optional(),
+      instruction: z.string().max(500).optional(),
+      expectedVersion: z.number().int(),
+    }),
+  );
+  return articleState(await requestImprovement(params.id, input));
+});
+
+route("POST", "articles/:id/improve/apply", async ({ req, params }) => {
+  const input = await body(req, z.object({ proposalId: z.string().max(80), sections: z.array(z.number().int().min(0)).max(100).optional(), expectedVersion: z.number().int() }));
+  return articleState(await applyStoredImprovement(params.id, input));
+});
+
+route("DELETE", "articles/:id/improve", async ({ params }) => articleState(await discardImprovement(params.id)));
+
+route("POST", "articles/:id/revisions/restore", async ({ req, params }) => {
+  const input = await body(req, z.object({ index: z.number().int().min(0), expectedVersion: z.number().int() }));
+  return articleState(await restoreRevision(params.id, input));
 });
 
 route("POST", "articles/:id/regenerate", async ({ params }) => {
@@ -1044,22 +1098,32 @@ route("GET", "reports", async ({ url }) => {
 
 route("GET", "media", async () => ({
   backend: blobConfigured() ? "blob" : null,
+  maxUploadBytes: MAX_UPLOAD_BYTES,
+  /** Which engine "Generate image" uses: an AI image provider (with SKOLAR branding composited) or the built-in SKOLAR renderer. */
+  generator: (() => {
+    const p = aiProvider();
+    return p ? `${p.label} (${p.model()}) + SKOLAR branding` : "SKOLAR renderer (designed brand graphic — no AI image provider configured)";
+  })(),
   items: await listMedia(),
   library: imageCredits.map((c) => ({ url: c.image, title: c.title, credit: c.author, license: c.license, sourceUrl: c.source })),
   formats: FORMAT_LABELS,
 }));
 
 async function readUpload(req: Request) {
+  if (!blobConfigured()) throw new HttpError(503, "Image storage is not configured: set BLOB_READ_WRITE_TOKEN (Vercel Blob read-write token) in the Vercel project and redeploy.");
   const form = await req.formData().catch(() => null);
-  const file = form?.get("file");
-  if (!(file instanceof File)) throw new HttpError(400, "Choose an image file.");
-  if (!ALLOWED_IMAGE_TYPES.has(file.type)) throw new HttpError(400, "Only JPEG, PNG, WebP or AVIF images.");
-  if (file.size > MAX_UPLOAD_BYTES) throw new HttpError(400, "Image must be 8 MB or smaller.");
+  if (!form) throw new HttpError(400, "The upload did not arrive as a file form. Choose the image again.");
+  const file = form.get("file");
+  if (!(file instanceof File) || file.size === 0) throw new HttpError(400, "Choose an image file.");
+  if (file.size > MAX_UPLOAD_BYTES) throw new HttpError(413, `Image is ${(file.size / 1048576).toFixed(1)} MB — the upload limit is ${(MAX_UPLOAD_BYTES / 1048576).toFixed(1)} MB.`);
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const kind = sniffImageType(bytes);
+  if (!kind || !ALLOWED_IMAGE_TYPES.has(kind)) throw new HttpError(415, `Unsupported format${file.type ? ` (${file.type})` : ""}. Use JPEG, PNG, WebP or AVIF.`);
   const alt = String(form?.get("alt") ?? "").trim().slice(0, 200);
   if (!alt) throw new HttpError(400, "Alt text is required.");
   if (form?.get("rightsConfirmed") !== "true") throw new HttpError(400, "Confirm that SKOLAR has the right to use this image.");
   return {
-    file: { bytes: Buffer.from(await file.arrayBuffer()), name: file.name },
+    file: { bytes, name: file.name },
     meta: {
       alt,
       credit: String(form?.get("credit") ?? "").trim().slice(0, 200) || undefined,
@@ -1077,27 +1141,27 @@ route("POST", "media", async ({ req }) => {
 route("POST", "articles/:id/images/upload", async ({ req, params }) => {
   const { file, meta } = await readUpload(req);
   const item = await uploadArticleImage(params.id, file, { ...meta, makeCover: true });
-  return { item, blockers: publishBlockers(item) };
+  return articleState(item);
 });
 route("POST", "articles/:id/images/generate", async ({ params }) => {
   const item = await regenerateImage(params.id);
-  return { item, blockers: publishBlockers(item) };
+  return articleState(item);
 });
 route("POST", "articles/:id/images/select", async ({ req, params }) => {
   const { imageId } = await body(req, z.object({ imageId: z.string().max(120) }));
   const item = await selectImage(params.id, imageId);
-  return { item, blockers: publishBlockers(item) };
+  return articleState(item);
 });
 route("POST", "articles/:id/images/library", async ({ req, params }) => {
   const input = await body(req, z.object({ url: z.string().max(300), alt: z.string().min(3).max(200) }));
   const lib = imageCredits.find((c) => c.image === input.url);
   if (!lib) throw new HttpError(400, "Not a library image.");
   const item = await useLibraryImage(params.id, { url: lib.image, title: lib.title, credit: lib.author, license: lib.license, sourceUrl: lib.source }, input.alt);
-  return { item, blockers: publishBlockers(item) };
+  return articleState(item);
 });
 route("DELETE", "articles/:id/images/:imageId", async ({ params }) => {
   const item = await deleteImage(params.id, params.imageId);
-  return { item, blockers: publishBlockers(item) };
+  return articleState(item);
 });
 
 /* ═════════════════════════ Live job view (persisted events + SSE) ═════════════════════════ */

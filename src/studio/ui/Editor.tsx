@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { renderArticleMarkdown, splitSections } from "../core/markdown";
 import { CATEGORY_KEYS, STRATEGIES, VERIFICATION_LABEL } from "../core/strategies";
-import type { ArticleSource, StudioArticle } from "../core/types";
+import { inferSourceType, newSourceId, parseSourceList, resolveCitations, validateSources } from "../core/sources";
+import type { ArticleImprovement, ArticleSource, EditorialWarning, StudioArticle } from "../core/types";
 import { api, ApiError, Badge, Button, Card, CardTitle, ErrorNote, Field, Input, Loading, Modal, Select, Status, Textarea, fmtDateTime, timeAgo, useAction, useApi, useToast } from "./kit";
 
 interface Meta {
@@ -16,15 +17,25 @@ interface Meta {
 }
 interface Loaded {
   item: StudioArticle;
+  /** Technical problems that prevent publishing. */
   blockers: string[];
+  /** What prevents approval (technical; plus editorial blocks for AI drafts). */
+  approvalBlockers: string[];
+  creationMethod: "AI_GENERATED" | "MANUALLY_WRITTEN";
+  publishing: { available: boolean; primary: string; reason: string | null };
   duplicates: Array<{ kind: string; id: string; title: string; similarity: number; status: string }>;
   nextSlot: string | null;
-  targets: { github: string | null; localFiles: boolean; siteRecord: boolean };
+  targets: { github: string | null; localFiles: boolean; firestore: boolean; siteRecord: boolean };
   job: { id: string; status: string; gaps: string[] } | null;
   timezone: string;
 }
 
 type Tab = "write" | "details" | "image" | "checks" | "cta";
+type ServerOut = { item: StudioArticle; blockers?: string[]; approvalBlockers?: string[] };
+
+/** Open editorial warnings (everything except technical errors and notes). */
+const openWarnings = (a: StudioArticle) => a.warnings.filter((w) => w.category !== "technical" && w.severity !== "info");
+const technicalWarnings = (a: StudioArticle) => a.warnings.filter((w) => w.category === "technical");
 
 export function Editor({ id }: { id: string }) {
   const toast = useToast();
@@ -37,6 +48,7 @@ export function Editor({ id }: { id: string }) {
   const { busy, run } = useAction();
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
+  const [ackOpen, setAckOpen] = useState(false);
 
   const versionRef = useRef(0);
   useEffect(() => {
@@ -60,15 +72,33 @@ export function Editor({ id }: { id: string }) {
     setDirty(true);
   }, []);
 
-  const applyServer = (out: { item: StudioArticle; blockers?: string[] }) => {
+  const applyServer = (out: ServerOut) => {
     versionRef.current = out.item.version;
     setDraft(out.item);
     setDirty(false);
-    setData((d) => (d ? { ...d, item: out.item, blockers: out.blockers ?? d.blockers } : d));
+    setData((d) => (d ? { ...d, item: out.item, blockers: out.blockers ?? d.blockers, approvalBlockers: out.approvalBlockers ?? d.approvalBlockers } : d));
+  };
+
+  /**
+   * Image operations save the image fields on the server immediately. If the editor has
+   * other unsaved edits, keep them and only take over the image fields + new version
+   * (so uploading never requires saving first, and the next save cannot undo the image).
+   */
+  const applyImageServer = (out: ServerOut) => {
+    if (!dirty) return applyServer(out);
+    versionRef.current = out.item.version;
+    setDraft((d) => (d ? { ...d, coverImage: out.item.coverImage, images: out.item.images, imageState: out.item.imageState, version: out.item.version } : d));
+    setData((d) => (d ? { ...d, item: out.item, blockers: out.blockers ?? d.blockers, approvalBlockers: out.approvalBlockers ?? d.approvalBlockers } : d));
   };
 
   const save = async (): Promise<boolean> => {
     if (!draft || !data) return false;
+    const problems = validateSources(draft.sources);
+    if (problems.length) {
+      setTab("checks");
+      toast("err", `Not saved — ${problems[0].message}${problems.length > 1 ? ` (+${problems.length - 1} more source problem${problems.length > 2 ? "s" : ""})` : ""}`);
+      return false;
+    }
     const out = await run("save", async () => {
       const o = await api<{ item: StudioArticle; blockers: string[] }>(`articles/${id}`, {
         method: "PATCH",
@@ -101,11 +131,27 @@ export function Editor({ id }: { id: string }) {
   const action = async (a: string, extra?: Record<string, unknown>, success?: string) => {
     if (dirty && !(await save())) return;
     await run(a, async () => {
-      const o = await api<{ item: StudioArticle; blockers?: string[]; nextSlot?: string }>(`articles/${id}/action`, { body: { action: a, expectedVersion: versionRef.current, ...extra } });
-      applyServer(o);
-      await reload();
-      if (a === "approve" && o.nextSlot) setScheduleOpen(true);
+      try {
+        const o = await api<ServerOut & { nextSlot?: string }>(`articles/${id}/action`, { body: { action: a, expectedVersion: versionRef.current, ...extra } });
+        applyServer(o);
+        await reload();
+        if (a === "approve" && o.nextSlot && data?.publishing.available) setScheduleOpen(true);
+      } catch (err) {
+        // Manual article with open editorial warnings: the editor reviews them and decides.
+        if (err instanceof ApiError && err.status === 409 && (err.data as { error?: string } | undefined)?.error === "warnings_need_acknowledgement") {
+          await reload();
+          setAckOpen(true);
+          return;
+        }
+        throw err;
+      }
     }, success);
+  };
+
+  const approve = () => {
+    if (!draft) return;
+    if (draft.origin === "manual" && openWarnings(draft).length) setAckOpen(true);
+    else void action("approve", undefined, "Approved");
   };
 
   const regenerateAll = () =>
@@ -121,8 +167,12 @@ export function Editor({ id }: { id: string }) {
 
   const a = draft;
   const locked = a.status === "researching";
-  const blocks = a.warnings.filter((w) => w.severity === "block").length;
-  const flaggedClaims = a.claims.filter((c) => !["verified", "partially_verified"].includes(c.status)).length;
+  const isManual = a.origin === "manual";
+  const technical = technicalWarnings(a);
+  const editorialBlocks = a.warnings.filter((w) => w.severity === "block" && w.category !== "technical");
+  const blocks = technical.length + (isManual ? 0 : editorialBlocks.length);
+  const uncited = a.claims.filter((c) => c.status === "unverified" && !c.labelled);
+  const flaggedClaims = uncited.length;
 
   return (
     <div className="pb-28">
@@ -137,27 +187,21 @@ export function Editor({ id }: { id: string }) {
       </div>
 
       {locked && <p className="mb-4 rounded-2xl bg-sky-50 p-4 text-sm text-sky-900">This article is being regenerated by the worker. It will return to the review queue when ready.</p>}
-      {(a.warnings.some((w) => w.severity === "block") || (a.status === "needs_review" && a.qualityGate && !a.qualityGate.passed)) && (
+      {data.approvalBlockers.length > 0 && !["published", "publishing"].includes(a.status) && (
         <div className="mb-4 rounded-2xl border border-red-700/15 bg-red-50 p-4 text-sm text-red-900">
-          <p className="font-semibold">Must be fixed before approval:</p>
+          <p className="font-semibold">{isManual ? "Technical problems — fix these before approving or publishing:" : "Must be fixed before approval (AI-generated draft):"}</p>
           <ul className="mt-1 list-disc space-y-1 pl-5">
-            {a.warnings.filter((w) => w.severity === "block").map((w, i) => (
-              <li key={i}>
-                {w.message}
-                {w.excerpt && <span className="block text-[0.8rem] italic opacity-80">“{w.excerpt}”</span>}
-              </li>
-            ))}
-            {(a.qualityGate?.reasons ?? []).filter((r) => !/blocking editorial warnings/i.test(r)).map((r, i) => <li key={`q${i}`}>{r}</li>)}
+            {data.approvalBlockers.map((b, i) => <li key={i}>{b}</li>)}
           </ul>
-          {flaggedClaims > 0 && (
+          {!isManual && flaggedClaims > 0 && (
             <div className="mt-3">
-              <p className="mb-1 font-semibold">Statements without a citation ({a.claims.filter((c) => c.status === "unverified").length}):</p>
+              <p className="mb-1 font-semibold">Statements without a citation ({flaggedClaims}):</p>
               <ul className="space-y-1 text-[0.8rem]">
-                {a.claims.filter((c) => c.status === "unverified").slice(0, 12).map((c) => (
+                {uncited.slice(0, 12).map((c) => (
                   <li key={c.id}>• {c.text}</li>
                 ))}
               </ul>
-              <p className="mt-2 text-[0.78rem]">For each one: add a source citation (<code>[[n]]</code>), rephrase it as general advice, or remove it.</p>
+              <p className="mt-2 text-[0.78rem]">For each one: add a source citation (<code>[[n]]</code>), label it as an estimate or example, rephrase it as general advice, or remove it.</p>
             </div>
           )}
           <div className="mt-3 flex flex-wrap gap-2">
@@ -167,7 +211,21 @@ export function Editor({ id }: { id: string }) {
               </Button>
             )}
             <Button size="sm" onClick={() => setTab("checks")}>Open sources & checks</Button>
-            <Button size="sm" variant="subtle" busy={busy === "check"} onClick={() => action("check", undefined, "Checks updated")}>Re-run checks</Button>
+            <Button size="sm" variant="subtle" busy={busy === "check"} onClick={() => action("check", undefined, "Checks updated")}>Recheck article</Button>
+          </div>
+        </div>
+      )}
+      {isManual && openWarnings(a).length > 0 && !["published", "publishing"].includes(a.status) && (
+        <div className="mb-4 rounded-2xl border border-gold-500/30 bg-gold-100/60 p-4 text-sm text-navy-900">
+          <p className="font-semibold">
+            {openWarnings(a).length} editorial warning{openWarnings(a).length === 1 ? "" : "s"} to review — you decide
+          </p>
+          <p className="mt-1 text-[0.82rem] text-ink-soft">
+            This article was written manually, so the checker advises but does not block. Important factual or legal points are marked “Check carefully”. Warnings stay on the article's record when you approve or publish; nothing is marked verified.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button size="sm" onClick={() => setTab("checks")}>Review warnings</Button>
+            <Button size="sm" variant="subtle" busy={busy === "check"} onClick={() => action("check", undefined, "Checks updated")}>Recheck article</Button>
           </div>
         </div>
       )}
@@ -207,8 +265,20 @@ export function Editor({ id }: { id: string }) {
         <div className="min-w-0">
           {tab === "write" && <WriteTab a={a} set={set} preview={preview} setPreview={setPreview} locked={locked} articleId={id} version={versionRef.current} dirty={dirty} onRegenerated={applyServer} onRegenerateAll={regenerateAll} busyAll={busy === "regen"} />}
           {tab === "details" && meta.data && <DetailsTab a={a} set={set} meta={meta.data} published={data.item.status === "published"} />}
-          {tab === "image" && <ImageTab a={a} set={set} articleId={id} dirty={dirty} onServer={applyServer} />}
-          {tab === "checks" && <ChecksTab a={a} set={set} gaps={data.job?.gaps ?? []} onRecheck={() => action("check", undefined, "Checks updated")} busy={busy === "check"} />}
+          {tab === "image" && <ImageTab a={a} set={set} articleId={id} onServer={applyImageServer} />}
+          {tab === "checks" && (
+            <ChecksTab
+              a={a}
+              set={set}
+              gaps={data.job?.gaps ?? []}
+              onRecheck={() => action("check", undefined, "Checks updated")}
+              busy={busy === "check"}
+              articleId={id}
+              version={versionRef.current}
+              dirty={dirty}
+              onServer={applyServer}
+            />
+          )}
           {tab === "cta" && meta.data && <CtaTab a={a} set={set} ctas={meta.data.ctas} />}
         </div>
 
@@ -221,19 +291,31 @@ export function Editor({ id }: { id: string }) {
       <div className="fixed inset-x-0 bottom-0 z-30 border-t border-navy-900/10 bg-paper/95 px-4 py-3 backdrop-blur lg:left-[17rem]">
         <div className="mx-auto flex max-w-[84rem] items-center justify-end gap-2 lg:px-6">
           <span className="mr-auto hidden text-[0.78rem] text-ink-faint sm:block">
-            {a.readingMinutes} min read · {a.sources.length} sources · {blocks} blocking warning{blocks === 1 ? "" : "s"}
+            {a.readingMinutes} min read · {a.sources.length} source{a.sources.length === 1 ? "" : "s"} · {blocks} blocking · {openWarnings(a).length} to review
           </span>
           <Button variant="primary" busy={busy === "save"} disabled={!dirty || locked} onClick={() => void save()}>
             Save
           </Button>
           {["draft", "needs_review", "rejected"].includes(a.status) && (
-            <Button variant="gold" busy={busy === "approve"} disabled={locked} onClick={() => action("approve", undefined, "Approved")}>
-              Approve
+            <Button variant="gold" busy={busy === "approve"} disabled={locked || data.approvalBlockers.length > 0} title={data.approvalBlockers[0]} onClick={approve}>
+              {isManual && openWarnings(a).length ? "Approve with warnings…" : "Approve"}
             </Button>
           )}
           {["approved", "scheduled"].includes(a.status) && (
-            <Button variant="gold" busy={busy === "publish"} onClick={() => confirm("Publish this article now? It is committed, deployed and then verified on the live site.") && action("publish", undefined, "Committed — waiting for deployment & verification")}>
-              Publish now
+            <Button
+              variant="gold"
+              busy={busy === "publish"}
+              disabled={!data.publishing.available || data.blockers.length > 0}
+              title={!data.publishing.available ? `Publishing unavailable: ${data.publishing.reason}` : data.blockers[0]}
+              onClick={() =>
+                confirm(
+                  `${isManual && openWarnings(a).length ? `This article still has ${openWarnings(a).length} open editorial warning(s). They stay on its record.
+
+` : ""}Publish now? ${data.targets.firestore ? "It is saved to the website and" : "It is committed, deployed and"} then verified on the live site.`,
+                ) && action("publish", undefined, data.targets.firestore ? "Saved to the website — verifying the live page" : "Committed — waiting for deployment & verification")
+              }
+            >
+              {isManual && openWarnings(a).length ? "Publish anyway" : "Publish now"}
             </Button>
           )}
         </div>
@@ -241,6 +323,18 @@ export function Editor({ id }: { id: string }) {
 
       <ScheduleModal open={scheduleOpen} onClose={() => setScheduleOpen(false)} nextSlot={data.nextSlot} tz={data.timezone} busy={busy === "schedule"} onConfirm={(at, expectedSlot) => action("schedule", at ? { at } : { expectedSlot }, "Scheduled").then(() => setScheduleOpen(false))} />
       <RejectModal open={rejectOpen} onClose={() => setRejectOpen(false)} onConfirm={(reason) => action("reject", { reason }, "Rejected").then(() => setRejectOpen(false))} busy={busy === "reject"} />
+      <AcknowledgeModal
+        open={ackOpen}
+        warnings={openWarnings(a)}
+        busy={busy === "approve"}
+        publishingAvailable={data.publishing.available}
+        onClose={() => setAckOpen(false)}
+        onReview={() => {
+          setAckOpen(false);
+          setTab("checks");
+        }}
+        onConfirm={() => action("approve", { acknowledgeWarnings: true }, "Approved — warnings kept on the record").then(() => setAckOpen(false))}
+      />
     </div>
   );
 }
@@ -383,7 +477,7 @@ function DetailsTab({ a, set, meta, published }: { a: StudioArticle; set: <K ext
           <Field label="Slug (URL)" hint={published ? "Locked: the article is published." : `/insights/${a.slug || "…"}`} className="sm:col-span-2">
             <Input value={a.slug} disabled={published} onChange={(e) => set("slug", e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, "-"))} />
           </Field>
-          <Field label="Excerpt" hint={`${a.excerpt.length}/220 · shown on article cards`} className="sm:col-span-2">
+          <Field label="Excerpt (required)" hint={`${a.excerpt.length}/220 · shown on article cards and used as the search description`} className="sm:col-span-2">
             <Textarea rows={2} value={a.excerpt} onChange={(e) => set("excerpt", e.target.value)} />
           </Field>
           <Field label="Category">
@@ -450,47 +544,113 @@ function ChipPicker({ label, items, selected, onToggle }: { label: string; items
 
 /* ═════════════════════════ Image tab ═════════════════════════ */
 
+/** Shrinks large images in the browser so uploads stay under Vercel's 4.5 MB request limit (the server optimises to WebP anyway). */
+async function prepareUpload(file: File, maxBytes: number): Promise<{ blob: Blob; name: string; note: string | null }> {
+  const MAX_EDGE = 2400;
+  let bmp: ImageBitmap | null = null;
+  try {
+    bmp = await createImageBitmap(file);
+  } catch {
+    // Not decodable by the browser (e.g. AVIF on older browsers): send as-is and let the server validate it.
+    return { blob: file, name: file.name, note: null };
+  }
+  const tooBig = file.size > maxBytes * 0.9;
+  const tooWide = Math.max(bmp.width, bmp.height) > MAX_EDGE;
+  if (!tooBig && !tooWide) {
+    bmp.close();
+    return { blob: file, name: file.name, note: null };
+  }
+  const scale = Math.min(1, MAX_EDGE / Math.max(bmp.width, bmp.height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(bmp.width * scale);
+  canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext("2d")!.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  bmp.close();
+  for (const q of [0.92, 0.85, 0.75, 0.6]) {
+    const out = await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/webp", q));
+    const blob = out && out.type === "image/webp" ? out : await new Promise<Blob | null>((r) => canvas.toBlob(r, "image/jpeg", q));
+    if (blob && blob.size <= maxBytes) {
+      const ext = blob.type === "image/webp" ? "webp" : "jpg";
+      return { blob, name: `${file.name.replace(/\.[a-z0-9]+$/i, "")}.${ext}`, note: `Resized in the browser to ${canvas.width}×${canvas.height} (${(blob.size / 1048576).toFixed(1)} MB).` };
+    }
+  }
+  throw new Error(`This image is too large to upload even after resizing (limit ${(maxBytes / 1048576).toFixed(1)} MB). Export it smaller and try again.`);
+}
+
 function ImageTab({
   a,
   set,
   articleId,
-  dirty,
   onServer,
 }: {
   a: StudioArticle;
   set: <K extends keyof StudioArticle>(k: K, v: StudioArticle[K]) => void;
   articleId: string;
-  dirty: boolean;
-  onServer: (o: { item: StudioArticle; blockers?: string[] }) => void;
+  onServer: (o: ServerOut) => void;
 }) {
-  const media = useApi<{ backend: string | null; library: Array<{ url: string; title: string; credit: string; license: string; sourceUrl: string }>; formats: Record<string, string> }>("media");
+  const toast = useToast();
+  const media = useApi<{ backend: string | null; maxUploadBytes: number; generator: string; library: Array<{ url: string; title: string; credit: string; license: string; sourceUrl: string }>; formats: Record<string, string> }>("media");
   const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreviewUrl] = useState<string | null>(null);
   const [form, setForm] = useState({ alt: "", credit: "", license: "", sourceUrl: "", rights: false });
   const [libAlt, setLibAlt] = useState("");
   const [open, setOpen] = useState<string | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [stage, setStage] = useState<string | null>(null);
   const { busy, run } = useAction();
   const cover = a.coverImage;
   const gallery = [...(a.images ?? [])].reverse();
-  const needSave = () => {
-    if (dirty) throw new Error("Save your other changes first.");
-  };
+  const maxBytes = media.data?.maxUploadBytes ?? 4.4 * 1024 * 1024;
+
+  useEffect(
+    () => () => {
+      if (preview) URL.revokeObjectURL(preview);
+    },
+    [preview],
+  );
 
   const call = (key: string, path: string, init: { method?: string; body?: unknown; form?: FormData }, ok?: string) =>
     run(key, async () => {
-      needSave();
-      onServer(await api<{ item: StudioArticle; blockers: string[] }>(`articles/${articleId}/${path}`, init));
+      onServer(await api<ServerOut>(`articles/${articleId}/${path}`, init));
     }, ok);
 
-  const upload = () => {
-    if (!file) return;
-    const fd = new FormData();
-    fd.set("file", file);
-    fd.set("alt", form.alt);
-    fd.set("credit", form.credit);
-    fd.set("license", form.license);
-    fd.set("sourceUrl", form.sourceUrl);
-    fd.set("rightsConfirmed", String(form.rights));
-    void call("upload", "images/upload", { form: fd }, "Uploaded to Vercel Blob and set as cover").then(() => setFile(null));
+  const choose = (f: File | null) => {
+    setUploadError(null);
+    setFile(f);
+    setPreviewUrl(f ? URL.createObjectURL(f) : null);
+    if (f && f.type && !/^image\/(jpeg|png|webp|avif)$/.test(f.type)) setUploadError(`“${f.name}” is ${f.type}. Use JPEG, PNG, WebP or AVIF.`);
+    if (f && !form.alt) setForm((x) => ({ ...x, alt: a.title }));
+  };
+
+  const missing = !file ? "Choose an image" : !form.alt.trim() ? "Add alt text" : !form.rights ? "Tick the ownership / licence box" : null;
+
+  const upload = async () => {
+    if (!file || missing) return;
+    setUploadError(null);
+    setStage("Preparing image…");
+    try {
+      const prepared = await prepareUpload(file, maxBytes);
+      const fd = new FormData();
+      fd.set("file", prepared.blob, prepared.name);
+      fd.set("alt", form.alt);
+      fd.set("credit", form.credit);
+      fd.set("license", form.license);
+      fd.set("sourceUrl", form.sourceUrl);
+      fd.set("rightsConfirmed", String(form.rights));
+      setStage(`${prepared.note ? `${prepared.note} ` : ""}Uploading to Vercel Blob and saving on the article…`);
+      const out = await api<ServerOut>(`articles/${articleId}/images/upload`, { form: fd });
+      // Success only when the saved article really references the uploaded Blob URL as its cover.
+      if (!out.item.coverImage?.url || !/^https:\/\//.test(out.item.coverImage.url)) throw new Error("The upload finished but the article has no cover URL — nothing was attached. Please try again.");
+      onServer(out);
+      setFile(null);
+      setPreviewUrl(null);
+      setForm({ alt: "", credit: "", license: "", sourceUrl: "", rights: false });
+      toast("ok", "Uploaded to Vercel Blob and saved as the article's cover");
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStage(null);
+    }
   };
 
   return (
@@ -498,13 +658,14 @@ function ImageTab({
       <Card>
         <CardTitle
           action={
-            <Button size="sm" variant="primary" busy={busy === "gen"} onClick={() => call("gen", "images/generate", { body: {} }, "New image generated")}>
+            <Button size="sm" variant="primary" busy={busy === "gen"} disabled={media.data ? !media.data.backend : false} onClick={() => call("gen", "images/generate", { body: {} }, "New image generated, stored in Vercel Blob and set as cover")}>
               {cover ? "Generate a different image" : "Generate image"}
             </Button>
           }
         >
           Cover image
         </CardTitle>
+        {media.data?.generator && <p className="-mt-2 mb-3 text-[0.72rem] text-ink-faint">Generate uses: {media.data.generator}. A generated image is shown here only after it has been uploaded to Vercel Blob and saved on the article.</p>}
         {a.imageState?.status === "failed" && (
           <p className="mb-4 rounded-xl bg-red-50 p-3 text-[0.82rem] text-red-800">
             Image generation failed: {a.imageState.error} — try again, upload an image, or pick a library photo.
@@ -524,8 +685,9 @@ function ImageTab({
                 <figcaption className="mt-1 text-[0.7rem] text-ink-faint">Listing card (4:3){cover.cardUrl ? "" : " — cropped from the cover"}</figcaption>
               </figure>
             </div>
+            <p className="break-all text-[0.7rem] text-ink-faint">Saved on the article: {cover.url}</p>
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="Alt text (required)" hint="Describe the image for screen readers." className="sm:col-span-2">
+              <Field label="Alt text (required)" hint="Describe the image for screen readers. Click Save to keep alt/caption changes." className="sm:col-span-2">
                 <Input value={cover.alt} onChange={(e) => set("coverImage", { ...cover, alt: e.target.value })} />
               </Field>
               <Field label="Caption (optional)">
@@ -538,7 +700,73 @@ function ImageTab({
             <p className="text-[0.72rem] text-ink-faint">Editing the article never regenerates its image; only the buttons here do.</p>
           </div>
         ) : (
-          <p className="rounded-xl bg-gold-100/60 p-4 text-[0.85rem] text-navy-900">No cover yet — publishing needs one. Generate a SKOLAR image, upload one SKOLAR may use, or choose a credited website photo.</p>
+          <p className="rounded-xl bg-gold-100/60 p-4 text-[0.85rem] text-navy-900">No cover yet — publishing needs one. Upload your own image below, generate a SKOLAR image, or choose a credited website photo.</p>
+        )}
+      </Card>
+
+      <Card>
+        <CardTitle>Upload your own image</CardTitle>
+        {media.error && !media.data ? (
+          <p className="rounded-xl bg-red-50 p-3 text-sm text-red-800">Could not check image storage: {media.error}</p>
+        ) : media.data && !media.data.backend ? (
+          <p className="rounded-xl bg-red-50 p-3 text-sm text-red-800">
+            Image storage is not configured: set <code>BLOB_READ_WRITE_TOKEN</code> (Vercel Blob read-write token) in the Vercel project, then redeploy. Uploading is disabled until then.
+          </p>
+        ) : (
+          <div className="space-y-4">
+            <label
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                choose(e.dataTransfer.files?.[0] ?? null);
+              }}
+              className="flex min-h-32 cursor-pointer flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-navy-900/15 bg-white p-4 text-center text-[0.85rem] text-ink-soft hover:border-navy-900/30"
+            >
+              {preview ? (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img src={preview} alt="" className="max-h-56 rounded-xl object-contain" />
+              ) : (
+                <span>
+                  <strong className="text-navy-900">Click to choose</strong> or drop an image here
+                </span>
+              )}
+              {file && (
+                <span className="text-[0.75rem]">
+                  {file.name} · {(file.size / 1048576).toFixed(1)} MB
+                </span>
+              )}
+              <span className="text-[0.72rem] text-ink-faint">JPEG, PNG, WebP or AVIF. Large images are resized automatically and stored as WebP in Vercel Blob.</span>
+              <input type="file" accept="image/jpeg,image/png,image/webp,image/avif" className="sr-only" onChange={(e) => choose(e.target.files?.[0] ?? null)} />
+            </label>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Alt text (required)" className="sm:col-span-2">
+                <Input value={form.alt} onChange={(e) => setForm({ ...form, alt: e.target.value })} placeholder="What the image shows" />
+              </Field>
+              <Field label="Credit (author / owner)">
+                <Input value={form.credit} placeholder="e.g. SKOLAR" onChange={(e) => setForm({ ...form, credit: e.target.value })} />
+              </Field>
+              <Field label="Licence">
+                <Input value={form.license} placeholder="e.g. Owned by SKOLAR, CC BY 4.0" onChange={(e) => setForm({ ...form, license: e.target.value })} />
+              </Field>
+              <Field label="Source URL (optional)" className="sm:col-span-2">
+                <Input value={form.sourceUrl} onChange={(e) => setForm({ ...form, sourceUrl: e.target.value })} />
+              </Field>
+            </div>
+            <label className="flex items-start gap-3 text-[0.85rem] text-navy-900">
+              <input type="checkbox" checked={form.rights} onChange={(e) => setForm({ ...form, rights: e.target.checked })} className="mt-1 h-4 w-4" />
+              SKOLAR owns this image or has a licence that allows using it here. No university logos, crests or official seals.
+            </label>
+            {uploadError && (
+              <p role="alert" className="rounded-xl bg-red-50 p-3 text-[0.82rem] text-red-800">
+                <strong>Upload failed — nothing was saved.</strong> {uploadError}
+              </p>
+            )}
+            {stage && <p className="text-[0.8rem] text-ink-soft">{stage}</p>}
+            <Button variant="primary" className="w-full" busy={Boolean(stage)} disabled={Boolean(missing)} onClick={() => void upload()}>
+              {missing ?? "Upload & use as cover"}
+            </Button>
+            <p className="text-[0.72rem] text-ink-faint">Uploading saves the image on the article immediately — any other unsaved edits stay in the editor.</p>
+          </div>
         )}
       </Card>
 
@@ -591,28 +819,6 @@ function ImageTab({
         </Card>
       )}
 
-      <Card>
-        <CardTitle>Upload or replace</CardTitle>
-        {media.data && !media.data.backend ? (
-          <p className="text-sm text-red-700">Vercel Blob is not configured (BLOB_READ_WRITE_TOKEN) — see Integrations.</p>
-        ) : (
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Image file" hint="JPEG, PNG, WebP or AVIF, up to 8 MB. Optimised to WebP and stored in Vercel Blob." className="sm:col-span-2">
-              <input type="file" accept="image/jpeg,image/png,image/webp,image/avif" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="block w-full text-sm" />
-            </Field>
-            <Field label="Alt text" className="sm:col-span-2"><Input value={form.alt} onChange={(e) => setForm({ ...form, alt: e.target.value })} /></Field>
-            <Field label="Credit (author / owner)"><Input value={form.credit} onChange={(e) => setForm({ ...form, credit: e.target.value })} /></Field>
-            <Field label="Licence"><Input value={form.license} placeholder="e.g. Owned by SKOLAR, CC BY 4.0" onChange={(e) => setForm({ ...form, license: e.target.value })} /></Field>
-            <Field label="Source URL (optional)" className="sm:col-span-2"><Input value={form.sourceUrl} onChange={(e) => setForm({ ...form, sourceUrl: e.target.value })} /></Field>
-            <label className="flex items-start gap-3 text-[0.85rem] text-navy-900 sm:col-span-2">
-              <input type="checkbox" checked={form.rights} onChange={(e) => setForm({ ...form, rights: e.target.checked })} className="mt-1 h-4 w-4" />
-              SKOLAR owns this image or has a licence that allows using it here. No university logos, crests or official seals.
-            </label>
-            <Button variant="primary" busy={busy === "upload"} disabled={!file || !form.alt || !form.rights} onClick={upload} className="sm:col-span-2">Upload & use as cover</Button>
-          </div>
-        )}
-      </Card>
-
       {media.data && (
         <Card>
           <CardTitle>Credited website photos</CardTitle>
@@ -644,37 +850,158 @@ function ImageTab({
 
 /* ═════════════════════════ Checks tab ═════════════════════════ */
 
-function ChecksTab({ a, set, gaps, onRecheck, busy }: { a: StudioArticle; set: <K extends keyof StudioArticle>(k: K, v: StudioArticle[K]) => void; gaps: string[]; onRecheck: () => void; busy: boolean }) {
+const SOURCE_TYPE_OPTIONS = [
+  { value: "official_university", label: "University" },
+  { value: "government", label: "Government" },
+  { value: "scholarship_authority", label: "Scholarship body" },
+  { value: "application_portal", label: "Official portal" },
+  { value: "publication", label: "Publication" },
+  { value: "other", label: "Other" },
+];
+
+/** Codes worth a careful human look before publishing (facts, money, legal/visa, promises). */
+const IMPORTANT = new Set(["guaranteed_admission", "guaranteed_visa", "guaranteed_scholarship", "employment_promise", "skolar_partnership", "unverified_claims", "unlabelled_estimate", "claims_need_review", "outdated_claims", "past_deadline", "no_sources", "missing_academic_year", "testimonial"]);
+
+type Issue = { key: string; code: string; message: string; excerpt?: string };
+
+function ChecksTab({
+  a,
+  set,
+  gaps,
+  onRecheck,
+  busy,
+  articleId,
+  version,
+  dirty,
+  onServer,
+}: {
+  a: StudioArticle;
+  set: <K extends keyof StudioArticle>(k: K, v: StudioArticle[K]) => void;
+  gaps: string[];
+  onRecheck: () => void;
+  busy: boolean;
+  articleId: string;
+  version: number;
+  dirty: boolean;
+  onServer: (o: ServerOut) => void;
+}) {
   const [showFacts, setShowFacts] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [instruction, setInstruction] = useState("");
+  const act = useAction();
   const counts = a.claims.reduce<Record<string, number>>((m, c) => ({ ...m, [c.status]: (m[c.status] ?? 0) + 1 }), {});
+  const problems = validateSources(a.sources);
+  const rowProblems = (i: number, field: "n" | "title" | "url") => problems.filter((p) => p.index === i && p.field === field);
+  const cites = resolveCitations(a.body, a.sources);
   const updateSource = (i: number, patch: Partial<ArticleSource>) => set("sources", a.sources.map((s, j) => (j === i ? { ...s, ...patch } : s)));
-  const addSource = () => set("sources", [...a.sources, { n: Math.max(0, ...a.sources.map((s) => s.n)) + 1, title: "", url: "https://", type: "official_university", accessedAt: new Date().toISOString().slice(0, 10) }]);
+  const addSource = () => set("sources", [...a.sources, { id: newSourceId(), n: Math.max(0, ...a.sources.map((s) => s.n)) + 1, title: "", url: "", type: "publication", accessedAt: new Date().toISOString().slice(0, 10) }]);
+
+  // Every issue the editor can hand to the AI.
+  const issues: Issue[] = [
+    ...a.warnings.filter((w) => w.severity !== "info").map((w, i) => ({ key: `w${i}`, code: w.code, message: w.message, excerpt: w.excerpt })),
+    ...a.claims.filter((c) => c.status === "unverified" && !c.labelled).map((c) => ({ key: `c-${c.id}`, code: "uncited_statement", message: "Factual statement without a citation.", excerpt: c.text })),
+  ];
+  const togglePick = (k: string) => setPicked((p) => {
+    const n = new Set(p);
+    if (n.has(k)) n.delete(k);
+    else n.add(k);
+    return n;
+  });
+
+  const improve = (selectedOnly: boolean) =>
+    act.run(selectedOnly ? "fix" : "improve", async () => {
+      if (dirty) throw new Error("Save your changes first — the AI works from the saved article.");
+      const chosen = selectedOnly ? issues.filter((x) => picked.has(x.key)) : [];
+      if (selectedOnly && !chosen.length) throw new Error("Tick at least one issue to fix.");
+      onServer(await api<ServerOut>(`articles/${articleId}/improve`, { body: { expectedVersion: version, issues: chosen.map(({ code, message, excerpt }) => ({ code, message, excerpt })), instruction: instruction.trim() || undefined } }));
+      setPicked(new Set());
+    }, "AI suggestion ready — compare it below. Nothing has been changed yet.");
 
   return (
     <div className="space-y-6">
       <Card>
-        <CardTitle action={<Button size="sm" busy={busy} onClick={onRecheck}>Re-run checks</Button>}>Editorial warnings</CardTitle>
+        <CardTitle action={<Button size="sm" busy={busy} onClick={onRecheck}>Recheck article</Button>}>Checks</CardTitle>
         {a.warnings.length === 0 ? (
           <p className="text-sm text-emerald-800">No warnings.</p>
         ) : (
           <ul className="space-y-2.5">
-            {a.warnings.map((w, i) => (
-              <li key={i} className={`rounded-xl p-3 text-[0.85rem] ${w.severity === "block" ? "bg-red-50 text-red-900" : w.severity === "warn" ? "bg-gold-100/70 text-navy-900" : "bg-stone/50 text-ink-soft"}`}>
-                <p className="flex flex-wrap items-center gap-2">
-                  <Badge tone={w.severity === "block" ? "red" : w.severity === "warn" ? "gold" : "grey"}>{w.severity === "block" ? "Must fix" : w.severity === "warn" ? "Check" : "Note"}</Badge>
-                  <span className="font-medium">{w.message}</span>
-                  {w.origin === "ai" && <span className="text-[0.7rem] text-ink-faint">AI reviewer</span>}
-                </p>
-                {w.excerpt && <p className="mt-1.5 border-l-2 border-current/20 pl-2.5 text-[0.8rem] italic opacity-80">“{w.excerpt}”</p>}
-              </li>
-            ))}
+            {a.warnings.map((w, i) => {
+              const tech = w.category === "technical";
+              const strong = tech || (a.origin === "ai" && w.severity === "block");
+              const key = `w${i}`;
+              const selectable = w.severity !== "info";
+              return (
+                <li key={i} className={`rounded-xl p-3 text-[0.85rem] ${strong ? "bg-red-50 text-red-900" : w.severity === "info" ? "bg-stone/50 text-ink-soft" : "bg-gold-100/70 text-navy-900"}`}>
+                  <div className="flex items-start gap-2.5">
+                    {selectable && !tech && <input type="checkbox" aria-label="Select this issue for AI" className="mt-1 h-4 w-4 shrink-0" checked={picked.has(key)} onChange={() => togglePick(key)} />}
+                    <div className="min-w-0">
+                      <p className="flex flex-wrap items-center gap-2">
+                        <Badge tone={strong ? "red" : w.severity === "info" ? "grey" : "gold"}>
+                          {tech ? "Technical — must fix" : a.origin === "ai" && w.severity === "block" ? "Must fix (AI draft)" : w.severity === "info" ? "Note" : IMPORTANT.has(w.code) || w.severity === "block" ? "Check carefully" : "Suggestion"}
+                        </Badge>
+                        <span className="font-medium">{w.message}</span>
+                        {w.origin === "ai" && <span className="text-[0.7rem] text-ink-faint">AI reviewer</span>}
+                      </p>
+                      {w.excerpt && <p className="mt-1.5 border-l-2 border-current/20 pl-2.5 text-[0.8rem] italic opacity-80">“{w.excerpt}”</p>}
+                    </div>
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         )}
+        {a.origin === "manual" && <p className="mt-3 text-[0.75rem] text-ink-faint">Manually written: technical problems block publishing; editorial warnings are advice — you can approve and publish after reviewing them. They stay on the article's record.</p>}
         {gaps.length > 0 && (
           <div className="mt-4 rounded-xl bg-stone/40 p-3 text-[0.8rem] text-ink-soft">
             <p className="font-semibold text-navy-900">Research could not verify</p>
             {gaps.map((g, i) => <p key={i}>• {g}</p>)}
           </div>
+        )}
+      </Card>
+
+      <Card>
+        <CardTitle>Improve with AI</CardTitle>
+        <p className="mb-3 text-[0.82rem] text-ink-soft">
+          The AI proposes revised sections for the issues above. It may not add facts, numbers, sources or citations. Your article is not changed until you compare and apply a suggestion.
+        </p>
+        <Field label="Extra instruction (optional)">
+          <Input value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="e.g. shorter paragraphs, friendlier tone" />
+        </Field>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" variant="primary" busy={act.busy === "improve"} disabled={Boolean(a.improvement)} onClick={() => improve(false)}>Improve article with AI</Button>
+          <Button size="sm" busy={act.busy === "fix"} disabled={Boolean(a.improvement) || picked.size === 0} onClick={() => improve(true)}>Fix selected issues ({picked.size})</Button>
+          <Button size="sm" variant="subtle" busy={busy} onClick={onRecheck}>Recheck article</Button>
+        </div>
+        {a.claims.some((c) => c.status === "unverified" && !c.labelled) && (
+          <details className="mt-4">
+            <summary className="cursor-pointer text-[0.8rem] font-semibold text-navy-900">Select uncited statements to fix</summary>
+            <ul className="mt-2 space-y-1.5">
+              {a.claims.filter((c) => c.status === "unverified" && !c.labelled).map((c) => (
+                <li key={c.id} className="flex items-start gap-2 text-[0.8rem]">
+                  <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0" checked={picked.has(`c-${c.id}`)} onChange={() => togglePick(`c-${c.id}`)} />
+                  <span>{c.text}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+        {a.improvement && <ImprovementView p={a.improvement} articleId={articleId} version={version} dirty={dirty} onServer={onServer} />}
+        {(a.revisions?.length ?? 0) > 0 && (
+          <details className="mt-4">
+            <summary className="cursor-pointer text-[0.8rem] font-semibold text-navy-900">Earlier versions ({a.revisions!.length})</summary>
+            <ul className="mt-2 space-y-1.5 text-[0.78rem] text-ink-soft">
+              {a.revisions!.map((r, i) => (
+                <li key={i} className="flex items-center justify-between gap-2">
+                  <span>{timeAgo(r.at)} · {r.reason}</span>
+                  <Button size="sm" variant="subtle" busy={act.busy === `rev${i}`} onClick={() => confirm("Restore this earlier text? The current text is kept as another earlier version.") && act.run(`rev${i}`, async () => {
+                    if (dirty) throw new Error("Save your changes first.");
+                    onServer(await api<ServerOut>(`articles/${articleId}/revisions/restore`, { body: { index: i, expectedVersion: version } }));
+                  }, "Earlier version restored")}>Restore</Button>
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
       </Card>
 
@@ -691,7 +1018,8 @@ function ChecksTab({ a, set, gaps, onRecheck, busy }: { a: StudioArticle; set: <
                 <span className="min-w-0 flex-1 text-navy-900">{c.text}</span>
               </div>
               <p className="mt-1 pl-1 text-[0.73rem] text-ink-faint">
-                {c.sourceNs.length ? `Sources ${c.sourceNs.join(", ")}` : "No citation"}
+                {c.sourceNs.length ? `Source${c.sourceNs.length > 1 ? "s" : ""} ${c.sourceNs.map((n) => `[[${n}]]`).join(" ")}${c.basis === "paragraph" ? " (passage citation)" : c.basis === "lead_in" ? " (from the introducing paragraph)" : ""}` : "No citation"}
+                {c.kind && c.kind !== "fact" ? ` · ${c.kind === "official_requirement" ? "official requirement" : c.kind === "personal" ? "personal example" : c.kind}` : ""}
                 {c.note ? ` · ${c.note}` : ""}
               </p>
             </li>
@@ -700,31 +1028,48 @@ function ChecksTab({ a, set, gaps, onRecheck, busy }: { a: StudioArticle; set: <
       </Card>
 
       <Card>
-        <CardTitle action={<Button size="sm" onClick={addSource}>Add source</Button>}>Sources</CardTitle>
+        <CardTitle
+          action={
+            <div className="flex gap-2">
+              <Button size="sm" onClick={() => setPasteOpen(true)}>Paste source list</Button>
+              <Button size="sm" onClick={addSource}>Add source</Button>
+            </div>
+          }
+        >
+          Sources ({a.sources.length})
+        </CardTitle>
+        <p className="mb-3 text-[0.78rem] text-ink-soft">
+          Cite a source in the text as <code>[[n]]</code>, where n is its number here. Every source needs a title and a full http(s) URL. Changes are kept when you click Save.
+        </p>
+        {(cites.missing.length > 0 || cites.unused.length > 0) && (
+          <div className="mb-3 space-y-1 rounded-xl bg-stone/50 p-3 text-[0.8rem]">
+            {cites.missing.length > 0 && <p className="text-red-800">Cited in the text but missing here: {cites.missing.map((n) => `[[${n}]]`).join(", ")}</p>}
+            {cites.unused.length > 0 && <p className="text-ink-soft">Never cited in the text: {cites.unused.map((n) => `[[${n}]]`).join(", ")}</p>}
+          </div>
+        )}
+        {cites.cited.length > 0 && cites.missing.length === 0 && problems.length === 0 && <p className="mb-3 text-[0.8rem] text-emerald-800">All {cites.cited.length} citation numbers resolve to a source in this list{dirty ? " (save to keep)" : ""}.</p>}
         <ul className="space-y-4">
-          {a.sources.map((s, i) => (
-            <li key={i} className="rounded-xl bg-paper p-3 ring-1 ring-navy-900/[0.06]">
-              <div className="grid gap-2 sm:grid-cols-[3rem_1fr_11rem]">
-                <Input aria-label="Number" type="number" value={s.n} onChange={(e) => updateSource(i, { n: Number(e.target.value) })} />
-                <Input aria-label="Title" value={s.title} placeholder="Page title" onChange={(e) => updateSource(i, { title: e.target.value })} />
-                <Select aria-label="Type" value={s.type} onChange={(e) => updateSource(i, { type: e.target.value as ArticleSource["type"] })} options={[
-                  { value: "official_university", label: "University" },
-                  { value: "government", label: "Government" },
-                  { value: "scholarship_authority", label: "Scholarship body" },
-                  { value: "application_portal", label: "Official portal" },
-                  { value: "publication", label: "Publication" },
-                  { value: "other", label: "Other" },
-                ]} />
-              </div>
-              <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_8rem_8rem_auto]">
-                <Input aria-label="URL" value={s.url} onChange={(e) => updateSource(i, { url: e.target.value })} />
-                <Input aria-label="Academic year" value={s.academicYear ?? ""} placeholder="2026/2027" onChange={(e) => updateSource(i, { academicYear: e.target.value || undefined })} />
-                <Input aria-label="Accessed" type="date" value={s.accessedAt ?? ""} onChange={(e) => updateSource(i, { accessedAt: e.target.value || undefined })} />
-                <Button size="sm" variant="subtle" onClick={() => set("sources", a.sources.filter((_, j) => j !== i))}>Remove</Button>
-              </div>
-            </li>
-          ))}
+          {a.sources.map((s, i) => {
+            const err = [...rowProblems(i, "n"), ...rowProblems(i, "title"), ...rowProblems(i, "url")];
+            return (
+              <li key={s.id ?? `row-${i}`} className={`rounded-xl bg-paper p-3 ring-1 ${err.length ? "ring-red-600/40" : "ring-navy-900/[0.06]"}`}>
+                <div className="grid gap-2 sm:grid-cols-[4.5rem_1fr_11rem]">
+                  <Input aria-label="Citation number" inputMode="numeric" value={Number.isFinite(s.n) && s.n > 0 ? String(s.n) : ""} placeholder="n" onChange={(e) => updateSource(i, { n: Number(e.target.value.replace(/\D/g, "")) || 0 })} className={rowProblems(i, "n").length ? "ring-2 ring-red-500/50" : ""} />
+                  <Input aria-label="Title" value={s.title} placeholder="Page or document title (required)" onChange={(e) => updateSource(i, { title: e.target.value })} className={rowProblems(i, "title").length ? "ring-2 ring-red-500/50" : ""} />
+                  <Select aria-label="Type" value={s.type} onChange={(e) => updateSource(i, { type: e.target.value as ArticleSource["type"] })} options={SOURCE_TYPE_OPTIONS} />
+                </div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_8rem_9rem_auto]">
+                  <Input aria-label="URL" value={s.url} placeholder="https://… (required)" onChange={(e) => updateSource(i, { url: e.target.value.trim() })} onBlur={() => !s.type || s.type === "publication" ? s.url && updateSource(i, { type: inferSourceType(s.url) }) : undefined} className={rowProblems(i, "url").length ? "ring-2 ring-red-500/50" : ""} />
+                  <Input aria-label="Academic year" value={s.academicYear ?? ""} placeholder="2026/2027" onChange={(e) => updateSource(i, { academicYear: e.target.value || undefined })} />
+                  <Input aria-label="Accessed" type="date" value={s.accessedAt ?? ""} onChange={(e) => updateSource(i, { accessedAt: e.target.value || undefined })} />
+                  <Button size="sm" variant="subtle" onClick={() => set("sources", a.sources.filter((_, j) => j !== i))}>Remove</Button>
+                </div>
+                {err.length > 0 && <ul className="mt-2 space-y-0.5 text-[0.75rem] text-red-700">{err.map((p, k) => <li key={k}>{p.message}</li>)}</ul>}
+              </li>
+            );
+          })}
         </ul>
+        {a.sources.length === 0 && <p className="text-[0.82rem] text-ink-faint">No sources yet. Use “Paste source list” to add several at once.</p>}
       </Card>
 
       {a.facts.length > 0 && (
@@ -742,10 +1087,124 @@ function ChecksTab({ a, set, gaps, onRecheck, busy }: { a: StudioArticle; set: <
           )}
         </Card>
       )}
+
+      <PasteSourcesModal
+        open={pasteOpen}
+        onClose={() => setPasteOpen(false)}
+        existing={a.sources}
+        cited={cites.cited}
+        onAdd={(list, replace) => {
+          set("sources", replace ? list : [...a.sources, ...list]);
+          setPasteOpen(false);
+        }}
+      />
     </div>
   );
 }
 
+function PasteSourcesModal({ open, onClose, existing, cited, onAdd }: { open: boolean; onClose: () => void; existing: ArticleSource[]; cited: number[]; onAdd: (list: ArticleSource[], replace: boolean) => void }) {
+  const [text, setText] = useState("");
+  const [replace, setReplace] = useState(existing.length === 0);
+  const startAt = replace ? 1 : Math.max(0, ...existing.map((s) => s.n)) + 1;
+  const parsed = useMemo(() => parseSourceList(text, { startAt }), [text, startAt]);
+  const list = parsed.sources.map((s) => ({ ...s, id: newSourceId() }));
+  const merged = replace ? list : [...existing, ...list];
+  const clash = validateSources(merged).filter((p) => p.field === "n");
+  const stillMissing = cited.filter((n) => !merged.some((s) => s.n === n));
+  return (
+    <Modal open={open} onClose={onClose} title="Paste source list" wide>
+      <div className="space-y-4">
+        <Field label="One source per line" hint="Examples: “[1] Study in Italy — European Commission https://…”, “2. Title. https://…”, “- [Title](https://…)”. A line without a URL or title is reported, never guessed.">
+          <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder={"[1] Page title — https://…\n[2] Page title — https://…"} className="font-mono text-[0.8rem]" />
+        </Field>
+        {existing.length > 0 && (
+          <label className="flex items-center gap-2 text-[0.85rem] text-navy-900">
+            <input type="checkbox" checked={replace} onChange={(e) => setReplace(e.target.checked)} className="h-4 w-4" /> Replace the current {existing.length} source{existing.length === 1 ? "" : "s"} (otherwise add to them)
+          </label>
+        )}
+        {list.length > 0 && (
+          <ol className="max-h-64 space-y-1.5 overflow-auto rounded-xl bg-white p-3 text-[0.8rem] ring-1 ring-navy-900/10">
+            {list.map((s) => (
+              <li key={s.id}>
+                <strong>[[{s.n}]]</strong> {s.title} <span className="break-all text-ink-faint">— {s.url}</span>
+              </li>
+            ))}
+          </ol>
+        )}
+        {parsed.problems.length > 0 && <ul className="space-y-0.5 text-[0.78rem] text-red-700">{parsed.problems.map((p, i) => <li key={i}>• {p}</li>)}</ul>}
+        {clash.length > 0 && <ul className="space-y-0.5 text-[0.78rem] text-red-700">{clash.map((p, i) => <li key={i}>• {p.message}</li>)}</ul>}
+        {list.length > 0 && stillMissing.length > 0 && <p className="text-[0.78rem] text-gold-700">After this, the text still cites {stillMissing.map((n) => `[[${n}]]`).join(", ")} without a source.</p>}
+        <Button variant="primary" className="w-full" disabled={!list.length || clash.length > 0} onClick={() => { onAdd(list, replace); setText(""); }}>
+          {list.length ? `${replace ? "Use" : "Add"} ${list.length} source${list.length === 1 ? "" : "s"}` : "Paste sources above"}
+        </Button>
+        <p className="text-[0.72rem] text-ink-faint">Then click Save. Sources are checked again on the server; nothing is saved if one is invalid.</p>
+      </div>
+    </Modal>
+  );
+}
+
+function ImprovementView({ p, articleId, version, dirty, onServer }: { p: ArticleImprovement; articleId: string; version: number; dirty: boolean; onServer: (o: ServerOut) => void }) {
+  const changed = p.sections.filter((s) => s.changed);
+  const [chosen, setChosen] = useState<Set<number>>(new Set(changed.filter((s) => !s.rejected).map((s) => s.index)));
+  const { busy, run } = useAction();
+  const stale = version !== p.baseVersion;
+  return (
+    <div className="mt-5 rounded-2xl border border-navy-900/10 bg-white p-4">
+      <p className="text-[0.9rem] font-semibold text-navy-900">Compare versions — AI suggestion ({changed.length} section{changed.length === 1 ? "" : "s"} changed)</p>
+      <p className="mt-1 text-[0.75rem] text-ink-faint">{timeAgo(p.createdAt)}{p.providers.length ? ` · ${p.providers.join(", ")}` : ""}. Nothing is applied until you click Apply. Applying keeps the current text as an earlier version.</p>
+      {stale && <p className="mt-2 rounded-xl bg-gold-100/70 p-2.5 text-[0.8rem] text-navy-900">The article changed after this suggestion was made — discard it and generate a new one.</p>}
+      {p.incomplete && <p className="mt-2 rounded-xl bg-stone/60 p-2.5 text-[0.8rem] text-ink-soft">{p.incomplete}</p>}
+      {changed.length === 0 && <p className="mt-3 text-[0.85rem] text-ink-soft">The AI did not propose any changes.</p>}
+      <div className="mt-3 space-y-4">
+        {p.sections.filter((s) => s.changed || s.rejected).map((s) => (
+          <div key={s.index} className="rounded-xl ring-1 ring-navy-900/10">
+            <label className="flex items-center gap-2 border-b border-navy-900/[0.06] px-3 py-2 text-[0.85rem] font-semibold text-navy-900">
+              <input type="checkbox" className="h-4 w-4" disabled={Boolean(s.rejected) || !s.changed} checked={chosen.has(s.index)} onChange={() => setChosen((c) => {
+                const n = new Set(c);
+                if (n.has(s.index)) n.delete(s.index);
+                else n.add(s.index);
+                return n;
+              })} />
+              {s.heading ?? "Introduction"}
+            </label>
+            {s.rejected && <p className="bg-red-50 px-3 py-2 text-[0.78rem] text-red-800">{s.rejected}</p>}
+            {(s.newNumbers.length > 0 || s.addedCitations.length > 0 || s.removedCitations.length > 0) && (
+              <div className="bg-gold-100/60 px-3 py-2 text-[0.75rem] text-navy-900">
+                {s.newNumbers.length > 0 && <p>New numbers not in your text: {s.newNumbers.join(", ")} — verify before applying.</p>}
+                {s.addedCitations.length > 0 && <p>Citations added: {s.addedCitations.map((n) => `[[${n}]]`).join(" ")} — check they support the sentence.</p>}
+                {s.removedCitations.length > 0 && <p>Citations removed: {s.removedCitations.map((n) => `[[${n}]]`).join(" ")}.</p>}
+              </div>
+            )}
+            <div className="grid gap-0 md:grid-cols-2">
+              <div className="border-navy-900/[0.06] p-3 md:border-r">
+                <p className="mb-1 text-[0.7rem] font-semibold uppercase tracking-wide text-ink-faint">Original</p>
+                <pre className="whitespace-pre-wrap break-words font-sans text-[0.78rem] leading-relaxed text-ink-soft">{s.original}</pre>
+              </div>
+              <div className="p-3">
+                <p className="mb-1 text-[0.7rem] font-semibold uppercase tracking-wide text-emerald-800">Suggested</p>
+                <pre className="whitespace-pre-wrap break-words font-sans text-[0.78rem] leading-relaxed text-navy-900">{s.proposed}</pre>
+              </div>
+            </div>
+            {s.notes.length > 0 && <ul className="border-t border-navy-900/[0.06] px-3 py-2 text-[0.75rem] text-ink-soft">{s.notes.map((n, i) => <li key={i}>• {n}</li>)}</ul>}
+          </div>
+        ))}
+      </div>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <Button variant="primary" busy={busy === "apply"} disabled={stale || chosen.size === 0} onClick={() => run("apply", async () => {
+          if (dirty) throw new Error("Save or discard your other edits first.");
+          onServer(await api<ServerOut>(`articles/${articleId}/improve/apply`, { body: { proposalId: p.id, sections: [...chosen], expectedVersion: version } }));
+        }, "Applied — previous text kept under Earlier versions. Checks re-ran.")}>
+          Apply {chosen.size} selected section{chosen.size === 1 ? "" : "s"}
+        </Button>
+        <Button variant="subtle" busy={busy === "discard"} onClick={() => run("discard", async () => onServer(await api<ServerOut>(`articles/${articleId}/improve`, { method: "DELETE" })), "Kept the original — suggestion discarded")}>
+          Keep original
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ═════════════════════════ CTA tab ═════════════════════════ */
 /* ═════════════════════════ CTA tab ═════════════════════════ */
 
 function CtaTab({ a, set, ctas }: { a: StudioArticle; set: <K extends keyof StudioArticle>(k: K, v: StudioArticle[K]) => void; ctas: Meta["ctas"] }) {
@@ -775,8 +1234,9 @@ function CtaTab({ a, set, ctas }: { a: StudioArticle; set: <K extends keyof Stud
 /* ═════════════════════════ Publish panel & modals ═════════════════════════ */
 
 const PUBLISH_STATE_TEXT: Record<string, { label: string; tone: "green" | "gold" | "red" | "blue" | "grey"; help: string }> = {
+  publishing: { label: "Publishing…", tone: "blue", help: "Saving the article to the publishing destination." },
   deploying: { label: "Committed — deploying", tone: "blue", help: "The commit is in GitHub; waiting for the production deployment to finish." },
-  verifying: { label: "Deployed — verifying", tone: "blue", help: "Checking that the live page shows exactly this version." },
+  verifying: { label: "Saved — verifying the live page", tone: "blue", help: "Checking that the public page shows exactly this version. It is marked published only after that check passes." },
   awaiting_push: { label: "Written locally — not live", tone: "gold", help: "GitHub is not configured, so the file was written to content/insights on this computer. Commit and push it; Studio will mark it published once the live page is verified." },
   published: { label: "Live and verified", tone: "green", help: "The production page shows this version." },
   failed: { label: "Failed", tone: "red", help: "See the error below. Retrying never creates a duplicate commit." },
@@ -790,11 +1250,25 @@ function PublishPanel({ data, a, onSchedule, onAction, busy, onReject, dirty }: 
     <>
       <Card>
         <CardTitle>Publishing</CardTitle>
+        <ol className="mb-4 space-y-1 text-[0.78rem] text-ink-soft">
+          <li>{a.status !== "draft" && a.status !== "needs_review" && a.status !== "rejected" ? "✓" : "1."} Save draft & review checks</li>
+          <li>{["approved", "scheduled", "publishing", "published"].includes(a.status) ? "✓" : "2."} Approve{a.review?.approvedWithWarnings ? ` (with ${a.review.approvedWithWarnings.count} reviewed warning${a.review.approvedWithWarnings.count === 1 ? "" : "s"})` : ""}</li>
+          <li>{a.status === "published" ? "✓" : "3."} Publish now or schedule</li>
+        </ol>
+        {!data.publishing.available && (
+          <div className="mb-4 rounded-xl bg-gold-100/70 p-3 text-[0.8rem] text-navy-900">
+            <p className="font-semibold">Publishing is unavailable</p>
+            <p className="mt-0.5 text-ink-soft">{data.publishing.reason} You can still save, check and approve; publishing works once this is configured.</p>
+          </div>
+        )}
         {data.blockers.length > 0 && a.status !== "published" && (
           <div className="mb-4 rounded-xl bg-stone/50 p-3 text-[0.8rem] text-ink-soft">
-            <p className="mb-1 font-semibold text-navy-900">Before publishing</p>
+            <p className="mb-1 font-semibold text-navy-900">Needed before publishing</p>
             <ul className="space-y-0.5">{data.blockers.map((b, i) => <li key={i}>• {b}</li>)}</ul>
           </div>
+        )}
+        {p?.openWarnings && a.status === "published" && (
+          <p className="mb-3 rounded-xl bg-stone/50 p-3 text-[0.75rem] text-ink-soft">Published with {p.openWarnings.count} open editorial warning(s) reviewed by the editor ({p.openWarnings.codes.join(", ")}). They remain on this article's record.</p>
         )}
         {a.status === "scheduled" && a.schedule?.at && (
           <p className="mb-3 rounded-xl bg-sky-50 p-3 text-[0.85rem] text-sky-900">
@@ -809,7 +1283,7 @@ function PublishPanel({ data, a, onSchedule, onAction, busy, onReject, dirty }: 
           </div>
         )}
         <div className="flex flex-col gap-2">
-          {a.status === "approved" && <Button variant="primary" onClick={onSchedule} disabled={dirty}>Schedule…</Button>}
+          {a.status === "approved" && <Button variant="primary" onClick={onSchedule} disabled={dirty || !data.publishing.available}>Schedule…</Button>}
           {a.status === "scheduled" && (
             <>
               <Button onClick={onSchedule}>Change time…</Button>
@@ -820,7 +1294,7 @@ function PublishPanel({ data, a, onSchedule, onAction, busy, onReject, dirty }: 
           {p?.state === "failed" && <Button variant="gold" busy={busy === "retry_publish"} onClick={() => onAction("retry_publish", undefined, "Retry started")}>Retry {p.failedStep === "deployment" ? "deployment" : "publishing"}</Button>}
           {["draft", "needs_review"].includes(a.status) && <Button variant="danger" onClick={onReject}>Reject</Button>}
           {["rejected", "approved"].includes(a.status) && <Button variant="subtle" busy={busy === "reopen"} onClick={() => onAction("reopen")}>Back to draft</Button>}
-          {a.status === "published" && !inFlight && <Button busy={busy === "publish"} onClick={() => onAction("publish", undefined, "Update committed")}>Re-publish changes</Button>}
+          {a.status === "published" && !inFlight && <Button busy={busy === "publish"} disabled={!data.publishing.available} onClick={() => onAction("publish", undefined, "Update sent — verifying the live page")}>Re-publish changes</Button>}
         </div>
         {p && (
           <dl className="mt-4 space-y-1.5 border-t border-navy-900/[0.06] pt-3 text-[0.75rem] text-ink-soft">
@@ -832,8 +1306,15 @@ function PublishPanel({ data, a, onSchedule, onAction, busy, onReject, dirty }: 
           </dl>
         )}
         <p className="mt-4 text-[0.72rem] leading-snug text-ink-faint">
-          Publishes to {data.targets.github ? `GitHub ${data.targets.github}` : data.targets.localFiles ? "content/insights in this folder (commit & push to deploy)" : "— not configured"}
-          {data.targets.siteRecord ? " + homepage listing (Firestore)" : ""}. An article is marked published only after the live page is verified.
+          Publishes to{" "}
+          {data.targets.github
+            ? `GitHub ${data.targets.github} (then Vercel deploys)`
+            : data.targets.firestore
+              ? "the website's Firestore record (live without a redeploy)"
+              : data.targets.localFiles
+                ? "content/insights in this folder (commit & push to deploy)"
+                : "— not configured"}
+          {data.targets.siteRecord && !data.targets.firestore ? " + homepage listing (Firestore)" : ""}. An article is marked published only after the live page is verified.
         </p>
       </Card>
       {(a.publishHistory?.length ?? 0) > 0 && (
@@ -902,6 +1383,35 @@ function ScheduleModal({ open, onClose, nextSlot, tz, busy, onConfirm }: { open:
             onConfirm(at);
           }}>Schedule at this time</Button>
         </div>
+      </div>
+    </Modal>
+  );
+}
+
+function AcknowledgeModal({ open, warnings, busy, publishingAvailable, onClose, onReview, onConfirm }: { open: boolean; warnings: EditorialWarning[]; busy: boolean; publishingAvailable: boolean; onClose: () => void; onReview: () => void; onConfirm: () => void }) {
+  const [ok, setOk] = useState(false);
+  useEffect(() => setOk(false), [open]);
+  return (
+    <Modal open={open} onClose={onClose} title="Approve with open warnings?" wide>
+      <div className="space-y-4">
+        <p className="text-[0.88rem] text-ink-soft">This article was written manually, so the checker does not block it. These warnings stay on the article's record and nothing is marked as verified.</p>
+        <ul className="max-h-72 space-y-2 overflow-auto">
+          {warnings.map((w, i) => (
+            <li key={i} className={`rounded-xl p-2.5 text-[0.82rem] ${w.severity === "block" ? "bg-red-50 text-red-900" : "bg-gold-100/70 text-navy-900"}`}>
+              <span className="font-medium">{w.message}</span>
+              {w.excerpt && <span className="mt-1 block text-[0.75rem] italic opacity-80">“{w.excerpt}”</span>}
+            </li>
+          ))}
+        </ul>
+        <label className="flex items-start gap-3 text-[0.85rem] text-navy-900">
+          <input type="checkbox" checked={ok} onChange={(e) => setOk(e.target.checked)} className="mt-1 h-4 w-4" />
+          I have reviewed these warnings and take editorial responsibility for publishing this article as it is.
+        </label>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="gold" busy={busy} disabled={!ok} onClick={onConfirm}>Approve anyway</Button>
+          <Button variant="subtle" onClick={onReview}>Review & fix first</Button>
+        </div>
+        {!publishingAvailable && <p className="text-[0.75rem] text-ink-faint">Publishing is not configured yet — approval is saved and you can publish once it is.</p>}
       </div>
     </Modal>
   );

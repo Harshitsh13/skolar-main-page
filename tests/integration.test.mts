@@ -373,7 +373,7 @@ test("publishing: commit → deployment → live verification; idempotent; failu
   githubFail = false;
   // validation: a broken citation blocks publishing
   await updateArticle(other, { body: `${failed.body}\n\nExtra claim [[99]].` });
-  await assert.rejects(publishArticle(other, { actor: "admin", revalidate: async () => undefined }), /Citations \[99\]/);
+  await assert.rejects(publishArticle(other, { actor: "admin", revalidate: async () => undefined }), /Citations \[\[99\]\] have no matching source/);
   delete process.env.GITHUB_TOKEN;
   delete process.env.GITHUB_REPO;
 });
